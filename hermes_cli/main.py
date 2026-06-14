@@ -4118,7 +4118,16 @@ def cmd_kanban(args):
     """Multi-profile collaboration board."""
     from hermes_cli.kanban import kanban_command
 
-    return kanban_command(args)
+    rc = kanban_command(args)
+    # Surface a non-zero result as the process exit code. The top-level
+    # dispatch in main() discards return values, so without this a blocked
+    # or failed kanban subcommand (e.g. an F3 commit-safety block on
+    # ``kanban complete``) would still exit 0 — invisible to ``&&``-chained
+    # worker briefs. rc 0/None falls through (process exits 0) so we never
+    # raise SystemExit on the success path.
+    if isinstance(rc, int) and rc != 0:
+        sys.exit(rc)
+    return rc
 
 
 def cmd_hooks(args):
