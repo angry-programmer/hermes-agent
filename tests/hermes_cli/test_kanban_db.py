@@ -5382,3 +5382,197 @@ def test_dispatch_once_invokes_supervisor(kanban_home, monkeypatch):
     assert task.last_heartbeat_at == now          # heartbeat bridged in the tick
     assert len(events) == 1                        # progress surfaced
     assert "tick-step b" in events[0]["payload"]
+
+
+# ---------------------------------------------------------------------------
+# Commit-safety: block completing a task whose git workspace still has
+# uncommitted / unpushed work, and forbid ephemeral scratch workspaces on
+# boards that opt in. Generic + config-gated (default off) — a "coding board"
+# is just a board/profile that sets these keys.
+# ---------------------------------------------------------------------------
+
+
+def _git_init_repo(path, *, dirty=False, with_upstream=False, unpushed=False):
+    """Create a git repo at ``path`` for commit-safety tests."""
+    import subprocess
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+    def g(*a):
+        subprocess.run(["git", "-C", str(path), *a], check=True,
+                       capture_output=True, text=True)
+
+    g("init", "-q")
+    g("config", "user.email", "t@example.com")
+    g("config", "user.name", "Test")
+    g("config", "commit.gpgsign", "false")
+    (path / "README").write_text("x", encoding="utf-8")
+    g("add", "-A")
+    g("commit", "-qm", "init")
+    if with_upstream:
+        bare = path.parent / (path.name + "-remote.git")
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)],
+                       check=True, capture_output=True, text=True)
+        g("remote", "add", "origin", str(bare))
+        g("push", "-q", "-u", "origin", "HEAD")
+        if unpushed:
+            (path / "more").write_text("y", encoding="utf-8")
+            g("add", "-A")
+            g("commit", "-qm", "more")
+    if dirty:
+        (path / "dirty.txt").write_text("z", encoding="utf-8")  # untracked
+    return path
+
+
+def _write_board_kanban_cfg(mapping):
+    """Write a board.yaml with a kanban: block for the default board."""
+    import yaml
+    board_dir = kb.kanban_db_path(board=None).parent
+    (board_dir / "board.yaml").write_text(
+        yaml.safe_dump({"kanban": mapping}), encoding="utf-8"
+    )
+
+
+def _running_dir_task(conn, workspace_path):
+    host = kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(
+        conn, title="cs", assignee="coder",
+        workspace_kind="dir", workspace_path=str(workspace_path),
+    )
+    kb.claim_task(conn, tid, claimer=f"{host}:worker")
+    return tid
+
+
+# --- complete-time commit-safety gate ---------------------------------------
+
+def test_complete_blocked_on_uncommitted_when_required(kanban_home, tmp_path):
+    _write_board_kanban_cfg({"require_clean_complete": True})
+    repo = _git_init_repo(tmp_path / "repo", dirty=True)
+    with kb.connect() as conn:
+        tid = _running_dir_task(conn, repo)
+        with pytest.raises(kb.DirtyWorkspaceError) as ei:
+            kb.complete_task(conn, tid, summary="done")
+        assert ei.value.reasons  # at least one reason
+        task = kb.get_task(conn, tid)
+        kinds = [r["kind"] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ?", (tid,)
+        )]
+    assert task.status == "running"  # not marked done
+    assert "completion_blocked_dirty_workspace" in kinds
+
+
+def test_complete_allowed_when_clean(kanban_home, tmp_path):
+    _write_board_kanban_cfg({"require_clean_complete": True})
+    repo = _git_init_repo(tmp_path / "repo", dirty=False)
+    with kb.connect() as conn:
+        tid = _running_dir_task(conn, repo)
+        ok = kb.complete_task(conn, tid, summary="done")
+        task = kb.get_task(conn, tid)
+    assert ok is True
+    assert task.status == "done"
+
+
+def test_complete_not_gated_when_config_off(kanban_home, tmp_path):
+    # No board.yaml -> default off -> dirty workspace still completes.
+    repo = _git_init_repo(tmp_path / "repo", dirty=True)
+    with kb.connect() as conn:
+        tid = _running_dir_task(conn, repo)
+        ok = kb.complete_task(conn, tid, summary="done")
+        task = kb.get_task(conn, tid)
+    assert ok is True
+    assert task.status == "done"
+
+
+def test_complete_blocked_on_unpushed_when_required(kanban_home, tmp_path):
+    _write_board_kanban_cfg({"require_pushed_complete": True})
+    repo = _git_init_repo(tmp_path / "repo", with_upstream=True, unpushed=True)
+    with kb.connect() as conn:
+        tid = _running_dir_task(conn, repo)
+        with pytest.raises(kb.DirtyWorkspaceError) as ei:
+            kb.complete_task(conn, tid, summary="done")
+        assert any("unpushed" in r for r in ei.value.reasons)
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_complete_unpushed_ignored_without_upstream(kanban_home, tmp_path):
+    # require_pushed_complete on, but no upstream configured -> can't verify
+    # -> fail-open (don't block).
+    _write_board_kanban_cfg({"require_pushed_complete": True})
+    repo = _git_init_repo(tmp_path / "repo", with_upstream=False)
+    with kb.connect() as conn:
+        tid = _running_dir_task(conn, repo)
+        ok = kb.complete_task(conn, tid, summary="done")
+    assert ok is True
+
+
+def test_complete_pushed_clean_repo_allowed(kanban_home, tmp_path):
+    _write_board_kanban_cfg(
+        {"require_clean_complete": True, "require_pushed_complete": True}
+    )
+    repo = _git_init_repo(tmp_path / "repo", with_upstream=True, unpushed=False)
+    with kb.connect() as conn:
+        tid = _running_dir_task(conn, repo)
+        ok = kb.complete_task(conn, tid, summary="done")
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_commit_safety_fail_open_non_git_workspace(kanban_home, tmp_path):
+    _write_board_kanban_cfg({"require_clean_complete": True})
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    (plain / "f.txt").write_text("x", encoding="utf-8")
+    with kb.connect() as conn:
+        tid = _running_dir_task(conn, plain)
+        ok = kb.complete_task(conn, tid, summary="done")  # fail-open
+    assert ok is True
+
+
+def test_commit_safety_skipped_for_workspaceless_task(kanban_home):
+    # A scratch/no-path task is unaffected by the gate even when enabled.
+    _write_board_kanban_cfg({"require_clean_complete": True})
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="np", assignee="coder")
+        kb.claim_task(conn, tid, claimer=f"{kb._claimer_id().split(':',1)[0]}:w")
+        ok = kb.complete_task(conn, tid, summary="done")
+    assert ok is True
+
+
+def test_dirty_workspace_error_is_valueerror_with_reasons(kanban_home, tmp_path):
+    _write_board_kanban_cfg({"require_clean_complete": True})
+    repo = _git_init_repo(tmp_path / "repo", dirty=True)
+    with kb.connect() as conn:
+        tid = _running_dir_task(conn, repo)
+        try:
+            kb.complete_task(conn, tid, summary="done")
+            assert False, "expected DirtyWorkspaceError"
+        except kb.DirtyWorkspaceError as exc:
+            assert isinstance(exc, ValueError)  # recoverable user error
+            assert exc.task_id == tid
+            assert isinstance(exc.reasons, list) and exc.reasons
+
+
+# --- create-time scratch guard ----------------------------------------------
+
+def test_forbid_scratch_rejects_scratch_create(kanban_home):
+    _write_board_kanban_cfg({"forbid_scratch": True})
+    with kb.connect() as conn:
+        with pytest.raises(ValueError):
+            kb.create_task(conn, title="s", assignee="coder",
+                           workspace_kind="scratch")
+
+
+def test_forbid_scratch_allows_dir_and_worktree(kanban_home, tmp_path):
+    _write_board_kanban_cfg({"forbid_scratch": True})
+    with kb.connect() as conn:
+        d = kb.create_task(conn, title="d", assignee="coder",
+                           workspace_kind="dir",
+                           workspace_path=str(tmp_path / "d"))
+        assert kb.get_task(conn, d).workspace_kind == "dir"
+
+
+def test_forbid_scratch_off_by_default(kanban_home):
+    # No board.yaml -> scratch still allowed (no behaviour change).
+    with kb.connect() as conn:
+        s = kb.create_task(conn, title="s", assignee="coder")
+        assert kb.get_task(conn, s).workspace_kind == "scratch"

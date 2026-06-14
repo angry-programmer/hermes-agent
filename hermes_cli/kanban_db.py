@@ -2194,6 +2194,17 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
+    # Coding boards opt out of ephemeral scratch workspaces (kanban.forbid_scratch):
+    # a task whose output must be committed needs a persistent dir/worktree, or
+    # _cleanup_workspace deletes the worker's work the moment it completes.
+    if workspace_kind == "scratch" and _kanban_config(
+        assignee, board
+    ).get("forbid_scratch"):
+        raise ValueError(
+            "this board forbids scratch workspaces (kanban.forbid_scratch); "
+            "use --workspace dir:<path> or --workspace worktree:<path> so the "
+            "worker's output is preserved"
+        )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -3841,6 +3852,84 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class DirtyWorkspaceError(ValueError):
+    """Raised by ``complete_task`` when commit-safety is enabled for the
+    board/profile and the task's git workspace still holds work that would be
+    lost or left unreviewable by marking the task done — uncommitted/untracked
+    changes, or commits not yet pushed to the configured upstream.
+
+    The human-readable reasons are attached as ``.reasons`` for callers that
+    want structured access. A ``ValueError`` subclass so existing tool-error
+    handlers treat it as a recoverable user error: the worker can commit/push
+    and call complete again.
+    """
+
+    def __init__(self, reasons: list[str], task_id: str):
+        self.reasons = list(reasons)
+        self.task_id = task_id
+        super().__init__(
+            "completion blocked: workspace has unsaved work — "
+            + "; ".join(reasons)
+            + " (commit and push your changes, then complete again)"
+        )
+
+
+def _git_query(args: list[str], cwd, *, timeout: int = 10):
+    """Run ``git -C <cwd> <args>`` read-only, capturing output. Returns the
+    CompletedProcess (caller inspects returncode/stdout)."""
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _workspace_commit_safety_reasons(
+    workspace_path: Optional[str],
+    *,
+    require_clean: bool,
+    require_pushed: bool,
+) -> list[str]:
+    """Return commit-safety violations for the git workspace at
+    ``workspace_path`` (empty list = safe / nothing to check).
+
+    Fail-open: a missing path, a non-git directory, or any git error returns
+    ``[]`` — commit-safety never blocks a workspace it cannot positively
+    verify as a dirty/ahead git repo. ``require_pushed`` only triggers when an
+    upstream is actually configured (otherwise "unpushed" is unverifiable and
+    must not block a worker that legitimately does not push)."""
+    if not workspace_path or not (require_clean or require_pushed):
+        return []
+    try:
+        p = Path(workspace_path)
+        if not p.exists():
+            return []
+        inside = _git_query(
+            ["rev-parse", "--is-inside-work-tree"], p, timeout=5
+        )
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return []  # not a git work tree -> fail-open
+        reasons: list[str] = []
+        if require_clean:
+            st = _git_query(["status", "--porcelain"], p)
+            if st.returncode == 0 and st.stdout.strip():
+                n = len(st.stdout.strip().splitlines())
+                reasons.append(f"{n} uncommitted change(s)")
+        if require_pushed:
+            upstream = _git_query(
+                ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+                p, timeout=5,
+            )
+            if upstream.returncode == 0 and upstream.stdout.strip():
+                ahead = _git_query(["rev-list", "--count", "@{u}..HEAD"], p)
+                if ahead.returncode == 0 and ahead.stdout.strip().isdigit():
+                    n = int(ahead.stdout.strip())
+                    if n > 0:
+                        reasons.append(f"{n} unpushed commit(s)")
+        return reasons
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []  # fail-open on any unexpected error
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3850,6 +3939,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -3907,6 +3997,41 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Commit-safety gate (opt-in via board/profile config). When enabled, a
+    # task in a completable state whose git workspace still holds uncommitted
+    # or unpushed work cannot be marked done — the work would be silently lost
+    # (scratch cleanup) or left unreviewable. Fail-open for non-git/unreadable
+    # workspaces. Emits an auditable block event and raises WITHOUT mutating
+    # task state, mirroring the created_cards gate above.
+    cs_row = conn.execute(
+        "SELECT status, workspace_path, assignee FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        cs_row
+        and cs_row["status"] in ("running", "ready", "blocked")
+        and cs_row["workspace_path"]
+    ):
+        cs_cfg = _kanban_config(cs_row["assignee"], board)
+        require_clean = bool(cs_cfg.get("require_clean_complete"))
+        require_pushed = bool(cs_cfg.get("require_pushed_complete"))
+        if require_clean or require_pushed:
+            reasons = _workspace_commit_safety_reasons(
+                cs_row["workspace_path"],
+                require_clean=require_clean,
+                require_pushed=require_pushed,
+            )
+            if reasons:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_blocked_dirty_workspace",
+                        {
+                            "reasons": reasons,
+                            "workspace_path": cs_row["workspace_path"],
+                        },
+                    )
+                raise DirtyWorkspaceError(reasons, task_id)
 
     with write_txn(conn):
         if expected_run_id is None:

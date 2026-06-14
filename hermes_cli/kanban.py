@@ -1897,13 +1897,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                done = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.DirtyWorkspaceError as exc:
+                # Commit-safety: the task's git workspace still has uncommitted
+                # or unpushed work. Surface it clearly and leave the task open
+                # so the worker can commit/push and retry.
+                failed.append(tid)
+                print(f"cannot complete {tid}: {exc}", file=sys.stderr)
+                continue
+            if not done:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
