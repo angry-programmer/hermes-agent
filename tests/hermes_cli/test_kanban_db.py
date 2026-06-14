@@ -4640,6 +4640,42 @@ def test_select_spawn_backend_board_overrides_profile(kanban_home):
     assert kb._select_spawn_backend(t, None).name == "hermes-native"
 
 
+def test_write_board_kanban_harness_sets_and_clears_only_harness(kanban_home):
+    import yaml
+    board_path = kb.kanban_db_path(board=None).parent / "board.yaml"
+    board_path.write_text(
+        yaml.safe_dump(
+            {
+                "name": "Default",
+                "kanban": {
+                    "harness": "tmux",
+                    "harnesses": {"cli-exec": {"command": ["codex", "exec"]}},
+                    "require_clean_complete": True,
+                },
+                "ui": {"icon": "box"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    kb.write_board_kanban_harness(board=None, harness="cli-exec")
+
+    data = yaml.safe_load(board_path.read_text(encoding="utf-8"))
+    assert data["name"] == "Default"
+    assert data["ui"] == {"icon": "box"}
+    assert data["kanban"]["harness"] == "cli-exec"
+    assert data["kanban"]["harnesses"] == {"cli-exec": {"command": ["codex", "exec"]}}
+    assert data["kanban"]["require_clean_complete"] is True
+
+    kb.write_board_kanban_harness(board=None, harness=None)
+
+    data = yaml.safe_load(board_path.read_text(encoding="utf-8"))
+    assert "harness" not in data["kanban"]
+    assert data["kanban"]["harnesses"] == {"cli-exec": {"command": ["codex", "exec"]}}
+    assert data["kanban"]["require_clean_complete"] is True
+
+
 def test_select_spawn_backend_no_config_is_native(kanban_home):
     with kb.connect() as conn:
         t = kb.get_task(conn, kb.create_task(conn, title="n", assignee="researcher"))

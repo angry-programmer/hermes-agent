@@ -261,6 +261,94 @@
     };
   }
 
+  function harnessTone(data, error) {
+    if (error) return "danger";
+    if (!data) return "muted";
+    if (data.defined === false) return "danger";
+    if (data.binary_on_path === false) return "warning";
+    return "ok";
+  }
+
+  function harnessTitle(data, error, context) {
+    if (error) return "Harness status failed to load: " + error;
+    if (!data) return "Loading harness status...";
+    const label = data.harness || data.effective || "hermes-native";
+    const source = data.source || "native";
+    const prefix = context === "task"
+      ? "Task harness"
+      : "Board default harness";
+    if (data.defined === false) {
+      const outcome = data.effective && data.effective !== label
+        ? `Dispatch will fall back to ${data.effective}.`
+        : "Dispatch will fail until that harness has a valid config block.";
+      return `${prefix}: ${label} from ${source}, but no matching definition exists. ${outcome} Precedence: task > board > profile > native.`;
+    }
+    if (data.binary_on_path === false) {
+      return `${prefix}: ${label} from ${source}, but its configured binary is not on PATH. Dispatch will fail until the binary is installed.`;
+    }
+    return `${prefix}: ${label} from ${source}. Precedence: task > board > profile > native.`;
+  }
+
+  function HarnessBadge(props) {
+    const data = props.harness || null;
+    const error = props.error || null;
+    const label = error
+      ? "harness unavailable"
+      : data
+        ? (data.harness || data.effective || "hermes-native")
+        : "loading harness";
+    const source = data && data.source ? data.source : "read";
+    const tone = harnessTone(data, error);
+    return h("span", {
+      className: cn("hermes-kanban-harness-badge", "hermes-kanban-harness-badge--" + tone),
+      title: harnessTitle(data, error, props.context),
+      "aria-label": harnessTitle(data, error, props.context),
+    },
+      h("span", { className: "hermes-kanban-harness-label" }, "Harness"),
+      h("span", { className: "hermes-kanban-harness-name" }, label),
+      h("span", { className: "hermes-kanban-harness-source" }, source),
+    );
+  }
+
+  function BoardHarnessControl(props) {
+    const data = props.harness || null;
+    const available = data && Array.isArray(data.available) ? data.available : [];
+    const currentName = data && data.harness ? data.harness : "";
+    const currentIsBoard = data && data.source === "board" && currentName;
+    const value = currentIsBoard ? currentName : "__inherit__";
+    const names = [];
+    available.forEach(function (item) {
+      if (item && item.name && names.indexOf(item.name) === -1) names.push(item.name);
+    });
+    if (currentIsBoard && names.indexOf(currentName) === -1) names.push(currentName);
+
+    return h("div", {
+      className: "hermes-kanban-harness-control",
+      title: harnessTitle(data, props.error, "board"),
+    },
+      h(Label, { className: "text-xs text-muted-foreground" }, "Board harness"),
+      h(Select, Object.assign({
+        value: value,
+        className: "h-8",
+        disabled: props.busy || !data,
+      }, selectChangeHandler(function (v) {
+        if (props.onSetBoardHarness) props.onSetBoardHarness(v);
+      })),
+        h(SelectOption, { value: "__inherit__" }, "Inherit"),
+        names.map(function (name) {
+          return h(SelectOption, { key: name, value: name }, name);
+        }),
+      ),
+      props.busy
+        ? h("div", { className: "hermes-kanban-harness-note" }, "Saving...")
+        : props.notice
+          ? h("div", { className: "hermes-kanban-harness-note hermes-kanban-harness-note--ok" }, props.notice)
+          : props.error
+            ? h("div", { className: "hermes-kanban-harness-note hermes-kanban-harness-note--err" }, props.error)
+            : null,
+    );
+  }
+
   // -------------------------------------------------------------------------
   // Minimal safe markdown renderer.
   //
@@ -478,6 +566,10 @@
     const boardData = kanbanBoard;
     const setBoardData = setKanbanBoard;
     const [config, setConfig] = useState(null);
+    const [boardHarness, setBoardHarness] = useState(null);
+    const [boardHarnessError, setBoardHarnessError] = useState(null);
+    const [boardHarnessBusy, setBoardHarnessBusy] = useState(false);
+    const [boardHarnessNotice, setBoardHarnessNotice] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
 
@@ -539,6 +631,46 @@
         })
         .finally(function () { setLoading(false); });
     }, [tenantFilter, includeArchived, board]);
+
+    const loadBoardHarness = useCallback(function () {
+      setBoardHarnessError(null);
+      const harnessUrl = assigneeFilter
+        ? `${API}/harness?profile=${encodeURIComponent(assigneeFilter)}`
+        : `${API}/harness`;
+      return SDK.fetchJSON(withBoard(harnessUrl, board))
+        .then(function (data) { setBoardHarness(data); })
+        .catch(function (err) {
+          setBoardHarness(null);
+          setBoardHarnessError(parseApiErrorMessage(err));
+        });
+    }, [board, assigneeFilter]);
+
+    useEffect(function () { loadBoardHarness(); }, [loadBoardHarness]);
+
+    const saveBoardHarness = useCallback(function saveBoardHarness(value) {
+      const nextHarness = value === "__inherit__" ? null : (value || null);
+      const harnessBoardUrl = assigneeFilter
+        ? `${API}/harness/board?profile=${encodeURIComponent(assigneeFilter)}`
+        : `${API}/harness/board`;
+      setBoardHarnessBusy(true);
+      setBoardHarnessError(null);
+      setBoardHarnessNotice(null);
+      return SDK.fetchJSON(withBoard(harnessBoardUrl, board), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ harness: nextHarness }),
+      }).then(function (res) {
+        const nextState = res && res.harness ? res.harness : null;
+        setBoardHarness(nextState);
+        setBoardHarnessNotice(nextHarness ? "Saved" : "Cleared");
+        return res;
+      }).catch(function (err) {
+        setBoardHarnessError(parseApiErrorMessage(err));
+        setBoardHarnessNotice(null);
+      }).finally(function () {
+        setBoardHarnessBusy(false);
+      });
+    }, [board, assigneeFilter]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
@@ -904,6 +1036,8 @@
       // event cursor so the WS reopens aligned to the new board's
       // latest_event_id on the next loadBoard.
       setBoardData(null);
+      setBoardHarness(null);
+      setBoardHarnessNotice(null);
       cursorRef.current = 0;
       setLoading(true);
       setBoard(nextSlug);
@@ -1000,7 +1134,16 @@
             return createNewBoard(payload).then(function () { setShowNewBoard(false); });
           },
         }) : null,
-        h(OrchestrationPanel, null),
+        h("div", { className: "hermes-kanban-settings-row" },
+          h(OrchestrationPanel, null),
+          h(BoardHarnessControl, {
+            harness: boardHarness,
+            error: boardHarnessError,
+            busy: boardHarnessBusy,
+            notice: boardHarnessNotice,
+            onSetBoardHarness: saveBoardHarness,
+          }),
+        ),
         h(AttentionStrip, {
           boardData,
           onOpen: setSelectedTaskId,
@@ -1012,12 +1155,17 @@
           includeArchived, setIncludeArchived,
           laneByProfile, setLaneByProfile,
           search, setSearch,
+          harness: boardHarness,
+          harnessError: boardHarnessError,
           onNudgeDispatch: function () {
             SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
               .then(loadBoard)
               .catch(function (e) { setError(String(e.message || e)); });
           },
-          onRefresh: loadBoard,
+          onRefresh: function () {
+            loadBoardHarness();
+            loadBoard();
+          },
         }),
        selectedIds.size > 0 ? h(BulkActionBar, {
          count: selectedIds.size,
@@ -2022,6 +2170,11 @@
         }),
         tx(t, "lanesByProfile", "Lanes by profile"),
       ),
+      h(HarnessBadge, {
+        harness: props.harness,
+        error: props.harnessError,
+        context: "board",
+      }),
       h("div", { className: "flex-1" }),
       h(Button, {
         onClick: props.onNudgeDispatch,
@@ -2794,6 +2947,8 @@
     const [uploadBusy, setUploadBusy] = useState(false);
     const [uploadErr, setUploadErr] = useState(null);
     const [editing, setEditing] = useState(false);
+    const [harness, setHarness] = useState(null);
+    const [harnessErr, setHarnessErr] = useState(null);
     // Home-channel notification toggles. homeChannels is the list of platforms
     // the user has a /sethome on; each entry has a `subscribed` bool telling
     // us whether this task is currently subscribed via that platform's home.
@@ -2808,6 +2963,16 @@
         .finally(function () { setLoading(false); });
     }, [props.taskId, boardSlug]);
 
+    const loadHarness = useCallback(function () {
+      setHarnessErr(null);
+      return SDK.fetchJSON(withBoard(`${API}/harness?task=${encodeURIComponent(props.taskId)}`, boardSlug))
+        .then(function (d) { setHarness(d); })
+        .catch(function (e) {
+          setHarness(null);
+          setHarnessErr(parseApiErrorMessage(e));
+        });
+    }, [props.taskId, boardSlug]);
+
     const loadHomeChannels = useCallback(function () {
       const qs = new URLSearchParams({ task_id: props.taskId });
       const url = withBoard(`${API}/home-channels?${qs}`, boardSlug);
@@ -2820,6 +2985,7 @@
     // (completion, block, crash, etc. — anything that'd make the drawer
     // show stale data if we only loaded on mount).
     useEffect(function () { load(); }, [load, props.eventTick]);
+    useEffect(function () { loadHarness(); }, [loadHarness, props.eventTick]);
     useEffect(function () { loadHomeChannels(); }, [loadHomeChannels]);
     useEffect(function () {
       function onKey(e) { if (e.key === "Escape" && !editing) props.onClose(); }
@@ -2897,7 +3063,7 @@
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(finalPatch),
-      }).then(function () { load(); props.onRefresh(); })
+      }).then(function () { load(); loadHarness(); props.onRefresh(); })
         .catch(function (e) { setPatchErr(parseApiErrorMessage(e)); });
     };
 
@@ -3043,6 +3209,8 @@
           homeBusy: homeBusy,
           onToggleHomeSub: toggleHomeSubscription,
           onRefresh: props.onRefresh,
+          harness: harness,
+          harnessErr: harnessErr,
           onUpload: handleUpload,
           onDeleteAttachment: handleDeleteAttachment,
           uploadBusy: uploadBusy,
@@ -3205,6 +3373,15 @@
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
+        h("div", { className: "hermes-kanban-meta-row" },
+          h("span", { className: "hermes-kanban-meta-label" }, "Harness"),
+          h("span", { className: "hermes-kanban-meta-value" },
+            h(HarnessBadge, {
+              harness: props.harness,
+              error: props.harnessErr,
+              context: "task",
+            })),
+        ),
         t.tenant ? h(MetaRow, { label: tx(i18n, "tenant", "Tenant"), value: t.tenant }) : null,
         h(MetaRow, {
           label: tx(i18n, "workspace", "Workspace"),

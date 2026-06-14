@@ -80,6 +80,215 @@ def test_board_empty(client):
 
 
 # ---------------------------------------------------------------------------
+# GET /harness
+# ---------------------------------------------------------------------------
+
+
+def test_harness_endpoint_defaults_to_native(client):
+    r = client.get("/api/plugins/kanban/harness?board=default")
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["harness"] == "hermes-native"
+    assert data["effective"] == "hermes-native"
+    assert data["source"] == "native"
+    assert data["defined"] is True
+    assert data["binary_on_path"] is True
+    assert data["native"] is True
+    assert data["profile"] == "default"
+    assert data["available"] == [
+        {"name": "hermes-native", "defined": True, "binary_on_path": True}
+    ]
+
+
+def test_harness_endpoint_resolves_board_config_and_binary_status(client, kanban_home):
+    kb.create_board("clitest")
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text(
+        "\n".join(
+            [
+                "kanban:",
+                "  harnesses:",
+                "    cli-exec:",
+                "      command:",
+                f"        - {sys.executable}",
+                "      pass_prompt: stdin",
+                "      prompt_file: .hermes-task.md",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    kb.board_dir("clitest").joinpath("board.yaml").write_text(
+        "kanban:\n  harness: cli-exec\n",
+        encoding="utf-8",
+    )
+
+    r = client.get("/api/plugins/kanban/harness?board=clitest&profile=coder")
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["board"] == "clitest"
+    assert data["harness"] == "cli-exec"
+    assert data["effective"] == "cli-exec"
+    assert data["source"] == "board"
+    assert data["defined"] is True
+    assert data["binary_on_path"] is True
+    assert data["profile"] == "coder"
+    assert {"name": "cli-exec", "defined": True, "binary_on_path": True} in data["available"]
+
+
+def test_harness_endpoint_task_override_precedes_board_default(client, kanban_home):
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text(
+        "\n".join(
+            [
+                "kanban:",
+                "  harnesses:",
+                "    cli-exec:",
+                "      command:",
+                f"        - {sys.executable}",
+                "    tmux:",
+                "      command:",
+                f"        - {sys.executable}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    kanban_home.joinpath("board.yaml").write_text(
+        "kanban:\n  harness: cli-exec\n",
+        encoding="utf-8",
+    )
+    conn = kb.connect(board="default")
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="override me",
+            assignee="coder",
+            harness="tmux",
+            board="default",
+        )
+    finally:
+        conn.close()
+
+    r = client.get(f"/api/plugins/kanban/harness?board=default&task={task_id}")
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["harness"] == "tmux"
+    assert data["effective"] == "tmux"
+    assert data["source"] == "task"
+    assert data["defined"] is True
+    assert data["binary_on_path"] is True
+    assert data["profile"] == "coder"
+
+
+def test_harness_endpoint_surfaces_undefined_harness_fallback(client, kanban_home):
+    kanban_home.joinpath("board.yaml").write_text(
+        "kanban:\n  harness: ghost-cli\n",
+        encoding="utf-8",
+    )
+
+    r = client.get("/api/plugins/kanban/harness?board=default&profile=default")
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["harness"] == "ghost-cli"
+    assert data["effective"] == "hermes-native"
+    assert data["source"] == "board"
+    assert data["defined"] is False
+    assert data["binary_on_path"] is None
+
+
+def test_set_board_harness_writes_board_yaml_and_returns_effective_state(client, kanban_home):
+    import yaml
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text(
+        "\n".join(
+            [
+                "kanban:",
+                "  harnesses:",
+                "    cli-exec:",
+                "      command:",
+                f"        - {sys.executable}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    kanban_home.joinpath("board.yaml").write_text(
+        "name: Default\nkanban:\n  require_clean_complete: true\n",
+        encoding="utf-8",
+    )
+
+    r = client.put(
+        "/api/plugins/kanban/harness/board?board=default&profile=coder",
+        json={"harness": "cli-exec"},
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["ok"] is True
+    assert data["harness"]["harness"] == "cli-exec"
+    assert data["harness"]["source"] == "board"
+    assert data["harness"]["profile"] == "coder"
+    saved = yaml.safe_load(kanban_home.joinpath("board.yaml").read_text(encoding="utf-8"))
+    assert saved["name"] == "Default"
+    assert saved["kanban"]["harness"] == "cli-exec"
+    assert saved["kanban"]["require_clean_complete"] is True
+
+    r = client.put(
+        "/api/plugins/kanban/harness/board?board=default&profile=coder",
+        json={"harness": None},
+    )
+
+    assert r.status_code == 200, r.text
+    saved = yaml.safe_load(kanban_home.joinpath("board.yaml").read_text(encoding="utf-8"))
+    assert "harness" not in saved["kanban"]
+    assert saved["kanban"]["require_clean_complete"] is True
+
+    r = client.put(
+        "/api/plugins/kanban/harness/board?board=default&profile=coder",
+        json={"harness": "hermes-native"},
+    )
+
+    assert r.status_code == 200, r.text
+    saved = yaml.safe_load(kanban_home.joinpath("board.yaml").read_text(encoding="utf-8"))
+    assert saved["kanban"]["harness"] == "hermes-native"
+    assert saved["kanban"]["require_clean_complete"] is True
+
+
+def test_set_board_harness_rejects_undefined_without_writing(client, kanban_home):
+    import yaml
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text(
+        "kanban:\n  harnesses:\n    cli-exec:\n      command: [codex, exec]\n",
+        encoding="utf-8",
+    )
+    board_path = kanban_home / "board.yaml"
+    board_path.write_text(
+        "kanban:\n  harness: cli-exec\n  require_clean_complete: true\n",
+        encoding="utf-8",
+    )
+
+    r = client.put(
+        "/api/plugins/kanban/harness/board?board=default&profile=coder",
+        json={"harness": "ghost-cli"},
+    )
+
+    assert r.status_code == 400
+    assert "undefined harness" in r.json()["detail"]
+    saved = yaml.safe_load(board_path.read_text(encoding="utf-8"))
+    assert saved["kanban"]["harness"] == "cli-exec"
+    assert saved["kanban"]["require_clean_complete"] is True
+
+
+# ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
 
@@ -245,6 +454,42 @@ def test_dashboard_initial_board_uses_backend_current_when_unpinned():
     assert "if (!storedBoard && !board && data && data.current)" in js
     assert "setBoard(data.current);" in js
     assert 'readSelectedBoard() || "default"' not in js
+
+
+def test_dashboard_renders_read_only_harness_badges():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    style = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css"
+    js = bundle.read_text()
+    css = style.read_text()
+
+    assert "function HarnessBadge(props)" in js
+    assert "const harnessUrl = assigneeFilter" in js
+    assert "SDK.fetchJSON(withBoard(harnessUrl, board))" in js
+    assert "withBoard(`${API}/harness?task=${encodeURIComponent(props.taskId)}`, boardSlug)" in js
+    assert 'context: "board"' in js
+    assert 'context: "task"' in js
+    assert ".hermes-kanban-harness-badge--ok" in css
+    assert ".hermes-kanban-harness-badge--warning" in css
+    assert ".hermes-kanban-harness-badge--danger" in css
+
+
+def test_dashboard_renders_board_harness_select_control():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    style = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css"
+    js = bundle.read_text()
+    css = style.read_text()
+
+    assert "function BoardHarnessControl(props)" in js
+    assert "function saveBoardHarness(value)" in js
+    assert "`${API}/harness/board`" in js
+    assert "JSON.stringify({ harness: nextHarness })" in js
+    assert "onSetBoardHarness: saveBoardHarness" in js
+    assert 'value: "__inherit__"' in js
+    assert "hermes-kanban-settings-row" in js
+    assert "hermes-kanban-settings-row" in css
+    assert ".hermes-kanban-harness-control" in css
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import sqlite3
 import time
 from dataclasses import asdict
@@ -232,6 +233,162 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
         "metadata": r.metadata,
         "error": r.error,
     }
+
+
+def _default_harness_profile() -> str:
+    """Return the profile used when a board-level harness read has no task.
+
+    Task reads use the task assignee. Board-header reads need a stable profile
+    for profile-level defaults and harness definitions, so mirror the
+    orchestration fallback: configured default_assignee, then active profile,
+    then ``default``.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli import profiles as profiles_mod
+
+        cfg = load_config() or {}
+        kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
+        explicit_default = str(kanban_cfg.get("default_assignee") or "").strip()
+        if explicit_default and profiles_mod.profile_exists(explicit_default):
+            return explicit_default
+        return profiles_mod.get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
+def _harness_command(name: str, block: Any) -> Optional[tuple[str, ...]]:
+    """Return configured argv for known harness definitions."""
+    try:
+        if name == "cli-exec":
+            return kanban_db.CliExecConfig.from_mapping(block).command
+        if name == "tmux":
+            return kanban_db.TmuxLaneConfig.from_mapping(block).command
+    except (AttributeError, ValueError):
+        return None
+    if isinstance(block, dict):
+        raw = block.get("command")
+        if isinstance(raw, str):
+            import shlex
+            return tuple(shlex.split(raw))
+        if isinstance(raw, (list, tuple)):
+            return tuple(str(part) for part in raw)
+    return None
+
+
+def _harness_binary_on_path(name: str, block: Any) -> Optional[bool]:
+    """Return binary availability for a harness definition.
+
+    ``None`` means the selected harness has no definition, so there is no
+    binary to check. Invalid definitions return ``False`` because dispatch will
+    fail once the backend tries to parse the config.
+    """
+    if name == kanban_db.DEFAULT_SPAWN_BACKEND:
+        return True
+    command = _harness_command(name, block)
+    if not command:
+        return False if isinstance(block, dict) else None
+    return shutil.which(command[0]) is not None
+
+
+def _harness_resolution_payload(
+    *,
+    task: Optional[kanban_db.Task],
+    profile: Optional[str],
+    board: Optional[str],
+) -> dict[str, Any]:
+    """Explain the current harness resolution without mutating config."""
+    resolved_profile = profile or (task.assignee if task and task.assignee else None)
+    if not resolved_profile:
+        resolved_profile = _default_harness_profile()
+
+    board_cfg = kanban_db._kanban_config(None, board)
+    profile_cfg = kanban_db._kanban_config(resolved_profile, None)
+    merged_cfg = kanban_db._kanban_config(resolved_profile, board)
+
+    harness: str
+    source: str
+    if task and task.harness:
+        harness = str(task.harness).strip()
+        source = "task"
+    else:
+        board_harness = str(board_cfg.get("harness") or "").strip()
+        profile_harness = str(profile_cfg.get("harness") or "").strip()
+        if board_harness:
+            harness = board_harness
+            source = "board"
+        elif profile_harness:
+            harness = profile_harness
+            source = "profile"
+        else:
+            harness = kanban_db.DEFAULT_SPAWN_BACKEND
+            source = "native"
+
+    effective = kanban_db.resolve_spawn_backend(harness).name
+    harnesses = merged_cfg.get("harnesses")
+    definitions = harnesses if isinstance(harnesses, dict) else {}
+    defined = harness == kanban_db.DEFAULT_SPAWN_BACKEND or harness in definitions
+    selected_block = definitions.get(harness) if isinstance(definitions, dict) else None
+
+    available = [
+        {
+            "name": kanban_db.DEFAULT_SPAWN_BACKEND,
+            "defined": True,
+            "binary_on_path": True,
+        }
+    ]
+    for name in sorted(definitions):
+        if name == kanban_db.DEFAULT_SPAWN_BACKEND:
+            continue
+        block = definitions.get(name)
+        available.append(
+            {
+                "name": str(name),
+                "defined": isinstance(block, dict),
+                "binary_on_path": _harness_binary_on_path(str(name), block),
+            }
+        )
+
+    return {
+        "harness": harness,
+        "effective": effective,
+        "source": source,
+        "defined": bool(defined),
+        "binary_on_path": _harness_binary_on_path(harness, selected_block)
+        if defined else None,
+        "native": harness == kanban_db.DEFAULT_SPAWN_BACKEND,
+        "profile": resolved_profile,
+        "board": kanban_db._normalize_board_slug(board) or kanban_db.get_current_board(),
+        "available": available,
+    }
+
+
+def _validate_defined_harness(
+    *,
+    harness: Optional[str],
+    profile: Optional[str],
+    board: Optional[str],
+) -> Optional[str]:
+    """Validate a task/board harness choice and return the normalized value."""
+    requested = str(harness).strip() if harness is not None else ""
+    if not requested:
+        return None
+    if requested == kanban_db.DEFAULT_SPAWN_BACKEND:
+        return requested
+
+    resolved_profile = (profile or "").strip() or _default_harness_profile()
+    cfg = kanban_db._kanban_config(resolved_profile, board)
+    harnesses = cfg.get("harnesses")
+    if not isinstance(harnesses, dict) or requested not in harnesses:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"undefined harness {requested!r} for profile "
+                f"{resolved_profile!r} on board "
+                f"{kanban_db._normalize_board_slug(board) or kanban_db.get_current_board()!r}"
+            ),
+        )
+    return requested
 
 
 # Hallucination-warning event kinds — see complete_task() in kanban_db.py.
@@ -508,6 +665,73 @@ def get_board(
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# GET /harness
+# ---------------------------------------------------------------------------
+
+@router.get("/harness")
+def get_harness(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    task: Optional[str] = Query(None, description="Optional task id for task override resolution"),
+    profile: Optional[str] = Query(None, description="Optional assignee profile for board-level resolution"),
+):
+    """Return the read-only effective harness state for a board or task."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        task_obj = None
+        if task:
+            task_obj = kanban_db.get_task(conn, task)
+            if task_obj is None:
+                raise HTTPException(status_code=404, detail=f"task {task} not found")
+        return _harness_resolution_payload(
+            task=task_obj,
+            profile=(profile or "").strip() or None,
+            board=board,
+        )
+    finally:
+        conn.close()
+
+
+class BoardHarnessBody(BaseModel):
+    harness: Optional[str] = None
+
+
+@router.put("/harness/board")
+def set_board_harness(
+    payload: BoardHarnessBody,
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    profile: Optional[str] = Query(None, description="Assignee profile used to validate available harnesses"),
+):
+    """Set or clear a board's default harness in ``board.yaml``."""
+    board = _resolve_board(board)
+    resolved_profile = (profile or "").strip() or _default_harness_profile()
+    requested = _validate_defined_harness(
+        harness=payload.harness,
+        profile=resolved_profile,
+        board=board,
+    )
+
+    try:
+        kanban_db.write_board_kanban_harness(
+            board=board,
+            harness=requested,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"failed to write board harness: {exc}")
+
+    return {
+        "ok": True,
+        "harness": _harness_resolution_payload(
+            task=None,
+            profile=resolved_profile,
+            board=board,
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

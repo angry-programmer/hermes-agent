@@ -7674,6 +7674,18 @@ def _read_yaml_mapping(path: Path) -> dict:
         return {}
 
 
+def _read_yaml_mapping_strict(path: Path) -> dict:
+    """Load a YAML mapping for write paths without swallowing parse errors."""
+    if not path.is_file():
+        return {}
+    import yaml
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a YAML mapping")
+    return data
+
+
 def _profile_config_path(profile: Optional[str]) -> Optional[Path]:
     """``<profile-home>/config.yaml`` for ``profile`` (``None`` if unresolvable)."""
     if not profile:
@@ -7712,6 +7724,36 @@ def _kanban_config(profile: Optional[str], board: Optional[str]) -> dict:
             else:
                 merged[key] = val
     return merged
+
+
+def write_board_kanban_harness(
+    board: Optional[str],
+    harness: Optional[str],
+) -> dict:
+    """Set or clear ``kanban.harness`` in a board's ``board.yaml`` atomically.
+
+    The writer is deliberately scoped to one key. It preserves all unrelated
+    top-level and ``kanban`` keys while using the same crash-safe YAML write
+    primitive as the profile config writer.
+    """
+    path = _board_config_path(board)
+    data = _read_yaml_mapping_strict(path)
+    kanban_section = data.get(_KANBAN_CONFIG_KEY)
+    if kanban_section is None:
+        kanban_section = {}
+        data[_KANBAN_CONFIG_KEY] = kanban_section
+    if not isinstance(kanban_section, dict):
+        raise ValueError(f"{path}: {_KANBAN_CONFIG_KEY!r} must be a mapping")
+
+    name = str(harness).strip() if harness is not None else ""
+    if name:
+        kanban_section["harness"] = name
+    else:
+        kanban_section.pop("harness", None)
+
+    from utils import atomic_yaml_write
+    atomic_yaml_write(path, data, sort_keys=False)
+    return data
 
 
 def _config_harness_name(task: Task, board: Optional[str]) -> Optional[str]:
