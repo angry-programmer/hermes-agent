@@ -676,6 +676,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stats.add_argument("--json", action="store_true")
 
+    p_reconcile = sub.add_parser(
+        "reconcile",
+        help="Advisory scan: done tasks whose persistent (dir/worktree) "
+             "workspace still has uncommitted/unpushed git work",
+    )
+    p_reconcile.add_argument("--json", action="store_true")
+    p_reconcile.add_argument(
+        "--emit", action="store_true",
+        help="Append one advisory 'reconcile_drift' task event per drifted task "
+             "(default: read-only, print only)",
+    )
+    p_reconcile.add_argument(
+        "--strict", action="store_true",
+        help="Exit non-zero when drift is found (for cron/CI gating)",
+    )
+    p_reconcile.add_argument(
+        "--no-clean", action="store_true",
+        help="Do not flag uncommitted changes",
+    )
+    p_reconcile.add_argument(
+        "--no-pushed", action="store_true",
+        help="Do not flag unpushed commits",
+    )
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -960,6 +984,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "reconcile": _cmd_reconcile,
         }
         handler = handlers.get(action)
         if not handler:
@@ -2406,6 +2431,58 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\n(stopped)")
         return 0
+
+
+def _cmd_reconcile(args: argparse.Namespace) -> int:
+    """Advisory scan: done tasks whose persistent workspace has unsaved git work.
+
+    Read-only by default (prints findings). ``--emit`` appends one advisory
+    ``reconcile_drift`` event per drifted task; it never changes task state.
+    """
+    require_clean = not getattr(args, "no_clean", False)
+    require_pushed = not getattr(args, "no_pushed", False)
+    emit = bool(getattr(args, "emit", False))
+    with kb.connect_closing() as conn:
+        findings = kb.reconcile_workspaces(
+            conn,
+            board=getattr(args, "board", None),
+            require_clean=require_clean,
+            require_pushed=require_pushed,
+            emit_events=emit,
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(
+            [
+                {
+                    "task_id": f.task_id,
+                    "assignee": f.assignee,
+                    "workspace_kind": f.workspace_kind,
+                    "workspace_path": f.workspace_path,
+                    "reasons": f.reasons,
+                }
+                for f in findings
+            ],
+            indent=2,
+            ensure_ascii=False,
+        ))
+    elif not findings:
+        tail = "/pushed." if require_pushed else "."
+        print(
+            "No workspace drift: every done task with a persistent workspace "
+            "is clean" + tail
+        )
+    else:
+        print(f"Workspace drift in {len(findings)} done task(s):")
+        for f in findings:
+            print(f"  {f.task_id}  [{f.workspace_kind}]  {f.workspace_path}")
+            for reason in f.reasons:
+                print(f"      - {reason}")
+        if emit:
+            print(f"\nRecorded {len(findings)} advisory 'reconcile_drift' event(s).")
+    # Pure advisory: succeed unless --strict, where drift -> rc 1 (cron/CI gating).
+    if getattr(args, "strict", False) and findings:
+        return 1
+    return 0
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:

@@ -3930,6 +3930,82 @@ def _workspace_commit_safety_reasons(
         return []  # fail-open on any unexpected error
 
 
+@dataclass(frozen=True)
+class ReconcileFinding:
+    """One drifted done-task surfaced by :func:`reconcile_workspaces`."""
+
+    task_id: str
+    assignee: Optional[str]
+    workspace_kind: str
+    workspace_path: str
+    reasons: list
+
+
+def reconcile_workspaces(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    require_clean: bool = True,
+    require_pushed: bool = True,
+    emit_events: bool = False,
+) -> "list[ReconcileFinding]":
+    """Advisory drift scan — the deferred, read-only half of commit-safety.
+
+    The completion gate (:func:`complete_task`) only catches unsaved work at the
+    moment a task is completed, and only when commit-safety is enabled. This
+    scans tasks that are ALREADY ``done`` with a persistent (``dir``/``worktree``)
+    workspace and reports any whose git workspace still holds uncommitted and/or
+    unpushed work — e.g. tasks completed before commit-safety was turned on, via
+    a path that bypassed the gate, or that drifted dirty afterwards.
+
+    Pure read-only by default: returns findings and mutates NO task state. With
+    ``emit_events=True`` it additionally appends ONE advisory ``reconcile_drift``
+    event per drifted task (an append to the event log — not a status change).
+    Reuses the same fail-open checks as the gate
+    (:func:`_workspace_commit_safety_reasons`): a missing path, non-git dir, or
+    git error yields no finding; ``require_pushed`` only triggers when an
+    upstream is configured. Scratch workspaces are excluded (ephemeral — there
+    is nothing durable to drift).
+    """
+    findings: list = []
+    rows = conn.execute(
+        "SELECT id, assignee, workspace_kind, workspace_path FROM tasks "
+        "WHERE status = 'done' AND workspace_kind IN ('dir', 'worktree') "
+        "AND workspace_path IS NOT NULL AND workspace_path != '' "
+        "ORDER BY id"
+    ).fetchall()
+    for row in rows:
+        reasons = _workspace_commit_safety_reasons(
+            row["workspace_path"],
+            require_clean=require_clean,
+            require_pushed=require_pushed,
+        )
+        if reasons:
+            findings.append(
+                ReconcileFinding(
+                    task_id=row["id"],
+                    assignee=row["assignee"],
+                    workspace_kind=row["workspace_kind"],
+                    workspace_path=row["workspace_path"],
+                    reasons=list(reasons),
+                )
+            )
+    if emit_events and findings:
+        with write_txn(conn):
+            for f in findings:
+                _append_event(
+                    conn,
+                    f.task_id,
+                    "reconcile_drift",
+                    {
+                        "reasons": f.reasons,
+                        "workspace_path": f.workspace_path,
+                        "workspace_kind": f.workspace_kind,
+                    },
+                )
+    return findings
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,

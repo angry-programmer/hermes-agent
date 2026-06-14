@@ -5576,3 +5576,149 @@ def test_forbid_scratch_off_by_default(kanban_home):
     with kb.connect() as conn:
         s = kb.create_task(conn, title="s", assignee="coder")
         assert kb.get_task(conn, s).workspace_kind == "scratch"
+
+
+# --- reconcile: advisory drift scan for already-done tasks (deferred F3 half) ---
+
+def _done_dir_task(conn, workspace_path, *, assignee="coder"):
+    """Create a dir task, claim it, and mark it done (no commit-safety gate)."""
+    tid = _running_dir_task(conn, workspace_path)
+    ok = kb.complete_task(conn, tid, summary="done")
+    assert ok is True
+    assert kb.get_task(conn, tid).status == "done"
+    return tid
+
+
+def test_reconcile_flags_done_task_with_uncommitted(kanban_home, tmp_path):
+    repo = _git_init_repo(tmp_path / "repo", dirty=False)
+    with kb.connect() as conn:
+        tid = _done_dir_task(conn, repo)
+        # drift appears AFTER completion
+        (Path(repo) / "leftover.txt").write_text("oops", encoding="utf-8")
+        findings = kb.reconcile_workspaces(conn)
+    assert len(findings) == 1
+    assert findings[0].task_id == tid
+    assert findings[0].workspace_kind == "dir"
+    assert any("uncommitted" in r for r in findings[0].reasons)
+
+
+def test_reconcile_flags_done_task_with_unpushed(kanban_home, tmp_path):
+    import subprocess
+    repo = _git_init_repo(tmp_path / "repo", with_upstream=True, unpushed=False)
+    with kb.connect() as conn:
+        _done_dir_task(conn, repo)
+        (Path(repo) / "after.txt").write_text("a", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "after"], check=True, capture_output=True)
+        findings = kb.reconcile_workspaces(conn)
+    assert len(findings) == 1
+    assert any("unpushed" in r for r in findings[0].reasons)
+
+
+def test_reconcile_ignores_clean_pushed_done_task(kanban_home, tmp_path):
+    repo = _git_init_repo(tmp_path / "repo", with_upstream=True, unpushed=False)
+    with kb.connect() as conn:
+        _done_dir_task(conn, repo)
+        findings = kb.reconcile_workspaces(conn)
+    assert findings == []
+
+
+def test_reconcile_ignores_scratch_workspace(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="s", assignee="coder", workspace_kind="scratch")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, tid, claimer=f"{host}:worker")
+        kb.complete_task(conn, tid, summary="done")
+        findings = kb.reconcile_workspaces(conn)
+    assert findings == []
+
+
+def test_reconcile_ignores_non_done_tasks(kanban_home, tmp_path):
+    repo = _git_init_repo(tmp_path / "repo", dirty=True)
+    with kb.connect() as conn:
+        _running_dir_task(conn, repo)  # running, not done
+        findings = kb.reconcile_workspaces(conn)
+    assert findings == []
+
+
+def test_reconcile_emit_events_appends_advisory_without_state_change(kanban_home, tmp_path):
+    repo = _git_init_repo(tmp_path / "repo", dirty=False)
+    with kb.connect() as conn:
+        tid = _done_dir_task(conn, repo)
+        (Path(repo) / "leftover.txt").write_text("oops", encoding="utf-8")
+        findings = kb.reconcile_workspaces(conn, emit_events=True)
+        task = kb.get_task(conn, tid)
+        kinds = [r["kind"] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
+    assert len(findings) == 1
+    assert task.status == "done"  # advisory only — no state mutation
+    assert kinds.count("reconcile_drift") == 1
+
+
+def test_reconcile_no_emit_by_default(kanban_home, tmp_path):
+    repo = _git_init_repo(tmp_path / "repo", dirty=False)
+    with kb.connect() as conn:
+        tid = _done_dir_task(conn, repo)
+        (Path(repo) / "leftover.txt").write_text("oops", encoding="utf-8")
+        kb.reconcile_workspaces(conn)  # emit_events defaults False
+        kinds = [r["kind"] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
+    assert "reconcile_drift" not in kinds
+
+
+def test_reconcile_fail_open_non_git_workspace(kanban_home, tmp_path):
+    plain = tmp_path / "plain"; plain.mkdir()
+    (plain / "f.txt").write_text("x", encoding="utf-8")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ng", assignee="coder",
+                             workspace_kind="dir", workspace_path=str(plain))
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, tid, claimer=f"{host}:worker")
+        kb.complete_task(conn, tid, summary="done")
+        findings = kb.reconcile_workspaces(conn)
+    assert findings == []
+
+
+def test_reconcile_respects_require_flags(kanban_home, tmp_path):
+    # With require_clean=False, an only-dirty workspace yields no finding.
+    repo = _git_init_repo(tmp_path / "repo", dirty=False)
+    with kb.connect() as conn:
+        _done_dir_task(conn, repo)
+        (Path(repo) / "leftover.txt").write_text("oops", encoding="utf-8")
+        findings = kb.reconcile_workspaces(conn, require_clean=False, require_pushed=False)
+    assert findings == []
+
+
+def test_reconcile_cli_strict_emit_reports_drift(kanban_home, tmp_path, capsys):
+    import argparse
+    from hermes_cli import kanban as kbcli
+    repo = _git_init_repo(tmp_path / "repo", dirty=False)
+    with kb.connect() as conn:
+        tid = _done_dir_task(conn, repo)
+    (Path(repo) / "leftover.txt").write_text("oops", encoding="utf-8")
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kbcli.build_parser(sub)
+    args = parser.parse_args(["kanban", "reconcile", "--strict", "--emit"])
+    rc = kbcli.kanban_command(args)
+    out = capsys.readouterr().out
+    assert rc == 1  # --strict + drift -> non-zero
+    assert tid in out
+    assert "uncommitted" in out
+    with kb.connect() as conn:
+        kinds = [r["kind"] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
+    assert "reconcile_drift" in kinds
+
+
+def test_reconcile_cli_clean_board_rc0(kanban_home, tmp_path, capsys):
+    import argparse
+    from hermes_cli import kanban as kbcli
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kbcli.build_parser(sub)
+    args = parser.parse_args(["kanban", "reconcile", "--strict"])
+    rc = kbcli.kanban_command(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "No workspace drift" in out
