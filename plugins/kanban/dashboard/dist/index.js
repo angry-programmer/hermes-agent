@@ -349,6 +349,52 @@
     );
   }
 
+  function TaskHarnessControl(props) {
+    const data = props.harness || null;
+    const available = data && Array.isArray(data.available) ? data.available : [];
+    const currentName = data && data.harness ? data.harness : "";
+    const currentIsTask = data && data.source === "task" && currentName;
+    const value = currentIsTask ? currentName : "__inherit__";
+    const names = [];
+    const [busy, setBusy] = useState(false);
+    available.forEach(function (item) {
+      if (item && item.name && names.indexOf(item.name) === -1) names.push(item.name);
+    });
+    if (currentIsTask && names.indexOf(currentName) === -1) names.push(currentName);
+    const inherited = data && data.source !== "task"
+      ? (data.harness || data.effective || "hermes-native")
+      : null;
+    const inheritLabel = inherited ? `Inherit (${inherited})` : "Inherit";
+
+    return h("div", {
+      className: "hermes-kanban-task-harness-control",
+      title: harnessTitle(data, props.error, "task"),
+    },
+      h(HarnessBadge, {
+        harness: data,
+        error: props.error,
+        context: "task",
+      }),
+      h(Select, Object.assign({
+        value: value,
+        className: "h-7 text-xs",
+        disabled: busy || !data,
+      }, selectChangeHandler(function (v) {
+        if (!props.onSetTaskHarness) return;
+        const nextHarness = v === "__inherit__" ? null : (v || null);
+        setBusy(true);
+        Promise.resolve(props.onSetTaskHarness(nextHarness))
+          .finally(function () { setBusy(false); });
+      })),
+        h(SelectOption, { value: "__inherit__" }, inheritLabel),
+        names.map(function (name) {
+          return h(SelectOption, { key: name, value: name }, name);
+        }),
+      ),
+      busy ? h("span", { className: "hermes-kanban-harness-note" }, "Saving...") : null,
+    );
+  }
+
   // -------------------------------------------------------------------------
   // Minimal safe markdown renderer.
   //
@@ -3211,6 +3257,7 @@
           onRefresh: props.onRefresh,
           harness: harness,
           harnessErr: harnessErr,
+          patchErr: patchErr,
           onUpload: handleUpload,
           onDeleteAttachment: handleDeleteAttachment,
           uploadBusy: uploadBusy,
@@ -3376,10 +3423,12 @@
         h("div", { className: "hermes-kanban-meta-row" },
           h("span", { className: "hermes-kanban-meta-label" }, "Harness"),
           h("span", { className: "hermes-kanban-meta-value" },
-            h(HarnessBadge, {
+            h(TaskHarnessControl, {
               harness: props.harness,
               error: props.harnessErr,
-              context: "task",
+              onSetTaskHarness: function (nextHarness) {
+                return props.onPatch({ harness: nextHarness });
+              },
             })),
         ),
         t.tenant ? h(MetaRow, { label: tx(i18n, "tenant", "Tenant"), value: t.tenant }) : null,
@@ -3405,6 +3454,9 @@
         onSpecify: props.onSpecify,
         onDecompose: props.onDecompose,
       }),
+      props.patchErr
+        ? h("div", { className: "text-xs text-destructive px-2" }, props.patchErr)
+        : null,
       h(DiagnosticsSection, {
         task: t,
         boardSlug: props.boardSlug,

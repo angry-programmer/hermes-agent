@@ -363,6 +363,14 @@ def _harness_resolution_payload(
     }
 
 
+def _payload_field_was_set(payload: BaseModel, field: str) -> bool:
+    """Return True when a nullable PATCH field was present in the JSON body."""
+    fields = getattr(payload, "model_fields_set", None)
+    if fields is None:
+        fields = getattr(payload, "__fields_set__", set())
+    return field in fields
+
+
 def _validate_defined_harness(
     *,
     harness: Optional[str],
@@ -1031,6 +1039,7 @@ class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
+    harness: Optional[str] = None
     title: Optional[str] = None
     body: Optional[str] = None
     result: Optional[str] = None
@@ -1061,6 +1070,27 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 raise HTTPException(status_code=409, detail=str(e))
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
+
+        # --- harness override --------------------------------------------
+        if _payload_field_was_set(payload, "harness"):
+            current = kanban_db.get_task(conn, task_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="task not found")
+            normalized = _validate_defined_harness(
+                harness=payload.harness,
+                profile=current.assignee,
+                board=board,
+            )
+            with kanban_db.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET harness = ? WHERE id = ?",
+                    (normalized, task_id),
+                )
+                conn.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                    "VALUES (?, 'harness_set', ?, ?)",
+                    (task_id, json.dumps({"harness": normalized}), int(time.time())),
+                )
 
         # --- status -------------------------------------------------------
         if payload.status is not None:

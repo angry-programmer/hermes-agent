@@ -383,6 +383,19 @@
   color: var(--color-destructive, #d14a4a);
 }
 
+.hermes-kanban-task-harness-control {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.hermes-kanban-task-harness-control select,
+.hermes-kanban-task-harness-control button {
+  max-width: 11rem;
+}
+
 .hermes-kanban-needs-assignee {
   font-size: 0.6rem !important;
   padding: 0.05rem 0.3rem !important;

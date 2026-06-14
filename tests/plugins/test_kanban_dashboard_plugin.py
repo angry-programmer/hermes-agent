@@ -8,6 +8,7 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -289,6 +290,203 @@ def test_set_board_harness_rejects_undefined_without_writing(client, kanban_home
 
 
 # ---------------------------------------------------------------------------
+# PATCH /tasks/:id harness override
+# ---------------------------------------------------------------------------
+
+
+def test_patch_task_harness_sets_override_and_event(client, kanban_home):
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text(
+        "\n".join(
+            [
+                "kanban:",
+                "  harnesses:",
+                "    cli-exec:",
+                "      command:",
+                f"        - {sys.executable}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with kb.connect(board="default") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="route this task",
+            assignee="coder",
+            board="default",
+        )
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}?board=default",
+        json={"harness": "cli-exec"},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["harness"] == "cli-exec"
+    harness = client.get(
+        f"/api/plugins/kanban/harness?board=default&task={task_id}",
+    ).json()
+    assert harness["harness"] == "cli-exec"
+    assert harness["source"] == "task"
+    with kb.connect(board="default") as conn:
+        task = kb.get_task(conn, task_id)
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'harness_set' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    assert task is not None
+    assert task.harness == "cli-exec"
+    assert event is not None
+    assert json.loads(event["payload"]) == {"harness": "cli-exec"}
+
+
+def test_patch_task_harness_clear_restores_board_resolution(client, kanban_home):
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text(
+        "\n".join(
+            [
+                "kanban:",
+                "  harnesses:",
+                "    cli-exec:",
+                "      command:",
+                f"        - {sys.executable}",
+                "    tmux:",
+                "      command:",
+                f"        - {sys.executable}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    kanban_home.joinpath("board.yaml").write_text(
+        "kanban:\n  harness: cli-exec\n",
+        encoding="utf-8",
+    )
+    with kb.connect(board="default") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="inherit again",
+            assignee="coder",
+            harness="tmux",
+            board="default",
+        )
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}?board=default",
+        json={"harness": None},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["harness"] is None
+    harness = client.get(
+        f"/api/plugins/kanban/harness?board=default&task={task_id}",
+    ).json()
+    assert harness["harness"] == "cli-exec"
+    assert harness["source"] == "board"
+    with kb.connect(board="default") as conn:
+        task = kb.get_task(conn, task_id)
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'harness_set' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    assert task is not None
+    assert task.harness is None
+    assert event is not None
+    assert json.loads(event["payload"]) == {"harness": None}
+
+
+def test_patch_task_harness_rejects_undefined_without_writing(client, kanban_home):
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text(
+        "kanban:\n  harnesses:\n    cli-exec:\n      command: [codex, exec]\n",
+        encoding="utf-8",
+    )
+    with kb.connect(board="default") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="bad route",
+            assignee="coder",
+            board="default",
+        )
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}?board=default",
+        json={"harness": "ghost-cli"},
+    )
+
+    assert r.status_code == 400
+    assert "undefined harness" in r.json()["detail"]
+    with kb.connect(board="default") as conn:
+        task = kb.get_task(conn, task_id)
+        events = conn.execute(
+            "SELECT kind FROM task_events "
+            "WHERE task_id = ? AND kind = 'harness_set'",
+            (task_id,),
+        ).fetchall()
+    assert task is not None
+    assert task.harness is None
+    assert events == []
+
+
+def test_patch_task_harness_allows_native_override_without_definition(client):
+    with kb.connect(board="default") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="force native",
+            assignee="coder",
+            board="default",
+        )
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}?board=default",
+        json={"harness": "hermes-native"},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["harness"] == "hermes-native"
+    harness = client.get(
+        f"/api/plugins/kanban/harness?board=default&task={task_id}",
+    ).json()
+    assert harness["harness"] == "hermes-native"
+    assert harness["source"] == "task"
+    assert harness["defined"] is True
+    with kb.connect(board="default") as conn:
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'harness_set' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    assert event is not None
+    assert json.loads(event["payload"]) == {"harness": "hermes-native"}
+
+
+def test_patch_task_without_harness_keeps_existing_override(client):
+    with kb.connect(board="default") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="keep route",
+            assignee="coder",
+            harness="tmux",
+            board="default",
+        )
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}?board=default",
+        json={"priority": 7},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["priority"] == 7
+    assert r.json()["task"]["harness"] == "tmux"
+
+
+# ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
 
@@ -490,6 +688,23 @@ def test_dashboard_renders_board_harness_select_control():
     assert "hermes-kanban-settings-row" in js
     assert "hermes-kanban-settings-row" in css
     assert ".hermes-kanban-harness-control" in css
+
+
+def test_dashboard_renders_task_harness_select_control():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    style = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css"
+    js = bundle.read_text()
+    css = style.read_text()
+
+    assert "function TaskHarnessControl(props)" in js
+    assert "withBoard(`${API}/harness?task=${encodeURIComponent(props.taskId)}`, boardSlug)" in js
+    assert "return props.onPatch({ harness: nextHarness });" in js
+    assert "const nextHarness = v === \"__inherit__\" ? null : (v || null)" in js
+    assert "load(); loadHarness(); props.onRefresh();" in js
+    assert "patchErr: patchErr" in js
+    assert "props.patchErr" in js
+    assert ".hermes-kanban-task-harness-control" in css
 
 
 # ---------------------------------------------------------------------------
