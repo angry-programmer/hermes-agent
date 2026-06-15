@@ -396,6 +396,60 @@
   max-width: 11rem;
 }
 
+.hermes-kanban-profile-harnesses {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.hermes-kanban-profile-harness-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.hermes-kanban-profile-harness-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-foreground) 3%, transparent);
+}
+
+.hermes-kanban-profile-harness-command {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.68rem;
+}
+
+.hermes-kanban-profile-harness-form {
+  display: grid;
+  grid-template-columns: minmax(7rem, 0.7fr) minmax(12rem, 2fr) minmax(8rem, 1fr) minmax(10rem, 1fr);
+  gap: 0.55rem;
+  align-items: end;
+}
+
+.hermes-kanban-profile-harness-command-field {
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .hermes-kanban-profile-harness-form {
+    grid-template-columns: 1fr;
+  }
+
+  .hermes-kanban-profile-harness-row {
+    grid-template-columns: 1fr;
+  }
+}
+
 .hermes-kanban-needs-assignee {
   font-size: 0.6rem !important;
   padding: 0.05rem 0.3rem !important;

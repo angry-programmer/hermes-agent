@@ -1181,7 +1181,7 @@
           },
         }) : null,
         h("div", { className: "hermes-kanban-settings-row" },
-          h(OrchestrationPanel, null),
+          h(OrchestrationPanel, { onHarnessChange: loadBoardHarness }),
           h(BoardHarnessControl, {
             harness: boardHarness,
             error: boardHarnessError,
@@ -1682,7 +1682,7 @@
   // auto-generate). Backed by /orchestration + /profiles endpoints.
   // ---------------------------------------------------------------------
 
-  function OrchestrationPanel() {
+  function OrchestrationPanel(props) {
     const [expanded, setExpanded] = useState(false);
     const [settings, setSettings] = useState(null);
     const [profiles, setProfiles] = useState([]);
@@ -1906,6 +1906,12 @@
                 }),
               ),
         ),
+        h("div", { className: "border-t pt-3" },
+          h(ProfileHarnessDefinitions, {
+            profiles: profiles,
+            onChanged: props && props.onHarnessChange,
+          }),
+        ),
       ),
     );
   }
@@ -1952,6 +1958,216 @@
           disabled: !!busy,
           title: "Auto-generate a description from this profile's skills and model",
         }, busy === "auto" ? "Generating…" : "⚗ Auto"),
+      ),
+    );
+  }
+
+  function ProfileHarnessDefinitions(props) {
+    const profiles = props.profiles || [];
+    const firstProfile = profiles.length > 0 ? profiles[0].name : "default";
+    const [profileName, setProfileName] = useState(firstProfile);
+    const [data, setData] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const [msg, setMsg] = useState(null);
+    const [draftName, setDraftName] = useState("cli-exec");
+    const [command, setCommand] = useState("");
+    const [passPrompt, setPassPrompt] = useState("stdin");
+    const [promptFile, setPromptFile] = useState(".hermes-task.md");
+    const [sessionName, setSessionName] = useState("klane-{task_id}");
+    const [sendKeys, setSendKeys] = useState("");
+
+    useEffect(function () {
+      if (!profileName && firstProfile) setProfileName(firstProfile);
+      if (profileName && profiles.length > 0 && !profiles.some(function (p) { return p.name === profileName; })) {
+        setProfileName(firstProfile);
+      }
+    }, [profileName, firstProfile, profiles]);
+
+    const loadProfileHarnesses = useCallback(function () {
+      if (!profileName) return Promise.resolve();
+      setBusy(true);
+      return SDK.fetchJSON(`${API}/harness/profile/${encodeURIComponent(profileName)}`)
+        .then(function (res) {
+          setData(res || null);
+          setMsg(null);
+        })
+        .catch(function (err) {
+          setData(null);
+          setMsg({ ok: false, text: "Load failed: " + parseApiErrorMessage(err) });
+        })
+        .finally(function () { setBusy(false); });
+    }, [profileName]);
+
+    useEffect(function () { loadProfileHarnesses(); }, [loadProfileHarnesses]);
+
+    function applyDraft(name, config) {
+      const cfg = config || {};
+      setDraftName(name);
+      setCommand(Array.isArray(cfg.command) ? cfg.command.join(" ") : String(cfg.command || ""));
+      setPassPrompt(String(cfg.pass_prompt || (name === "tmux" ? "send-keys" : "stdin")));
+      setPromptFile(String(cfg.prompt_file || ".hermes-task.md"));
+      setSessionName(String(cfg.session_name || "klane-{task_id}"));
+      setSendKeys(String(cfg.send_keys || ""));
+    }
+
+    function buildHarnessConfig() {
+      const config = {
+        command: command.trim(),
+        pass_prompt: passPrompt,
+        prompt_file: promptFile.trim() || ".hermes-task.md",
+      };
+      if (draftName === "tmux") {
+        config.session_name = sessionName.trim() || "klane-{task_id}";
+        if (sendKeys.trim()) config.send_keys = sendKeys.trim();
+      }
+      return config;
+    }
+
+    function saveProfileHarnessDefinition(name, config) {
+      if (!profileName) return Promise.resolve();
+      setBusy(true);
+      setMsg(null);
+      return SDK.fetchJSON(`${API}/harness/profile/${encodeURIComponent(profileName)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name, config: config }),
+      }).then(function (res) {
+        setData(res || null);
+        setMsg({ ok: true, text: config ? "Harness saved." : "Harness deleted." });
+        if (props.onChanged) props.onChanged();
+        return res;
+      }).catch(function (err) {
+        setMsg({ ok: false, text: "Save failed: " + parseApiErrorMessage(err) });
+      }).finally(function () {
+        setBusy(false);
+      });
+    }
+
+    const definitions = data && data.harnesses ? data.harnesses : {};
+    const names = Object.keys(definitions).sort();
+    const promptModes = draftName === "tmux"
+      ? ["send-keys", "file-arg", "none"]
+      : ["stdin", "file-arg", "none"];
+
+    return h("div", { className: "hermes-kanban-profile-harnesses" },
+      h("div", { className: "flex items-center justify-between gap-2" },
+        h("div", { className: "flex flex-col gap-1" },
+          h(Label, { className: "text-xs text-muted-foreground" }, "Harness definitions"),
+          h(Select, Object.assign({
+            value: profileName,
+            className: "h-8",
+          }, selectChangeHandler(function (v) { if (v) setProfileName(v); })),
+            profiles.length === 0
+              ? h(SelectOption, { value: "default" }, "default")
+              : profiles.map(function (p) {
+                  return h(SelectOption, { key: p.name, value: p.name }, p.name);
+                }),
+          ),
+        ),
+        h(Button, { onClick: loadProfileHarnesses, size: "sm", disabled: busy }, "Reload"),
+      ),
+      msg ? h("div", {
+        className: msg.ok ? "hermes-kanban-msg-ok" : "hermes-kanban-msg-err",
+      }, msg.text) : null,
+      names.length === 0
+        ? h("div", { className: "text-xs text-muted-foreground" }, "No harness definitions.")
+        : h("div", { className: "hermes-kanban-profile-harness-list" },
+            names.map(function (name) {
+              const entry = definitions[name] || {};
+              const cfg = entry.config || {};
+              const commandText = Array.isArray(cfg.command) ? cfg.command.join(" ") : String(cfg.command || "");
+              const binaryState = entry.binary_on_path === false ? "missing" : "ready";
+              return h("div", { key: name, className: "hermes-kanban-profile-harness-row" },
+                h("div", { className: "min-w-0" },
+                  h("div", { className: "flex items-center gap-2 text-xs" },
+                    h("span", { className: "font-mono font-semibold" }, name),
+                    h("span", { className: "hermes-kanban-harness-note" }, binaryState),
+                  ),
+                  h("div", { className: "hermes-kanban-profile-harness-command" }, commandText),
+                ),
+                h("div", { className: "flex items-center gap-2" },
+                  h(Button, {
+                    onClick: function () { applyDraft(name, cfg); },
+                    size: "sm",
+                    disabled: busy,
+                  }, "Edit"),
+                  h(Button, {
+                    onClick: function () { saveProfileHarnessDefinition(name, null); },
+                    size: "sm",
+                    disabled: busy,
+                  }, "Delete"),
+                ),
+              );
+            }),
+          ),
+      h("div", { className: "hermes-kanban-profile-harness-form" },
+        h("div", { className: "flex flex-col gap-1" },
+          h(Label, { className: "text-xs text-muted-foreground" }, "Name"),
+          h(Select, Object.assign({
+            value: draftName,
+            className: "h-8",
+          }, selectChangeHandler(function (v) {
+            const next = v || "cli-exec";
+            setDraftName(next);
+            setPassPrompt(next === "tmux" ? "send-keys" : "stdin");
+          })),
+            h(SelectOption, { value: "cli-exec" }, "cli-exec"),
+            h(SelectOption, { value: "tmux" }, "tmux"),
+          ),
+        ),
+        h("div", { className: "flex flex-col gap-1 hermes-kanban-profile-harness-command-field" },
+          h(Label, { className: "text-xs text-muted-foreground" }, "Command"),
+          h(Input, {
+            value: command,
+            onChange: function (e) { setCommand(e.target.value); },
+            placeholder: draftName === "tmux" ? "codex" : "codex exec",
+            className: "h-8 text-xs",
+          }),
+        ),
+        h("div", { className: "flex flex-col gap-1" },
+          h(Label, { className: "text-xs text-muted-foreground" }, "pass_prompt"),
+          h(Select, Object.assign({
+            value: passPrompt,
+            className: "h-8",
+          }, selectChangeHandler(setPassPrompt)),
+            promptModes.map(function (mode) {
+              return h(SelectOption, { key: mode, value: mode }, mode);
+            }),
+          ),
+        ),
+        h("div", { className: "flex flex-col gap-1" },
+          h(Label, { className: "text-xs text-muted-foreground" }, "prompt_file"),
+          h(Input, {
+            value: promptFile,
+            onChange: function (e) { setPromptFile(e.target.value); },
+            className: "h-8 text-xs",
+          }),
+        ),
+        draftName === "tmux" ? h("div", { className: "flex flex-col gap-1" },
+          h(Label, { className: "text-xs text-muted-foreground" }, "session_name"),
+          h(Input, {
+            value: sessionName,
+            onChange: function (e) { setSessionName(e.target.value); },
+            className: "h-8 text-xs",
+          }),
+        ) : null,
+        draftName === "tmux" ? h("div", { className: "flex flex-col gap-1 hermes-kanban-profile-harness-command-field" },
+          h(Label, { className: "text-xs text-muted-foreground" }, "send_keys"),
+          h(Input, {
+            value: sendKeys,
+            onChange: function (e) { setSendKeys(e.target.value); },
+            className: "h-8 text-xs",
+          }),
+        ) : null,
+        h("div", { className: "flex items-end gap-2" },
+          h(Button, {
+            onClick: function () {
+              saveProfileHarnessDefinition(draftName, buildHarnessConfig());
+            },
+            size: "sm",
+            disabled: busy || !command.trim(),
+          }, busy ? "Saving..." : "Save harness"),
+        ),
       ),
     );
   }

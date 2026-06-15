@@ -290,6 +290,225 @@ def test_set_board_harness_rejects_undefined_without_writing(client, kanban_home
 
 
 # ---------------------------------------------------------------------------
+# Profile harness definition CRUD
+# ---------------------------------------------------------------------------
+
+
+def test_get_profile_harnesses_returns_profile_scoped_definitions(client, kanban_home):
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text(
+        "\n".join(
+            [
+                "kanban:",
+                "  harnesses:",
+                "    cli-exec:",
+                "      command:",
+                f"        - {sys.executable}",
+                "        - -m",
+                "      pass_prompt: stdin",
+                "      prompt_file: .hermes-task.md",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    kanban_home.joinpath("board.yaml").write_text(
+        "kanban:\n  harnesses:\n    tmux:\n      command: [tmux]\n",
+        encoding="utf-8",
+    )
+
+    r = client.get("/api/plugins/kanban/harness/profile/coder")
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["profile"] == "coder"
+    assert "cli-exec" in data["harnesses"]
+    assert "tmux" not in data["harnesses"]
+    assert data["harnesses"]["cli-exec"]["config"]["command"] == [sys.executable, "-m"]
+    assert data["harnesses"]["cli-exec"]["binary_on_path"] is True
+
+
+def test_put_profile_harness_upserts_cli_exec_and_preserves_other_config(client, kanban_home):
+    import yaml
+
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    config_path = profile_dir / "config.yaml"
+    config_path.write_text(
+        "model:\n  default: gpt-test\nkanban:\n  default_assignee: coder\n",
+        encoding="utf-8",
+    )
+
+    r = client.put(
+        "/api/plugins/kanban/harness/profile/coder",
+        json={
+            "name": "cli-exec",
+            "config": {
+                "command": [sys.executable, "-m", "pytest"],
+                "pass_prompt": "stdin",
+                "prompt_file": ".task.md",
+            },
+        },
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["ok"] is True
+    assert data["profile"] == "coder"
+    assert data["harnesses"]["cli-exec"]["config"]["command"] == [
+        sys.executable,
+        "-m",
+        "pytest",
+    ]
+    assert data["harnesses"]["cli-exec"]["config"]["prompt_file"] == ".task.md"
+    assert {"name": "cli-exec", "defined": True, "binary_on_path": True} in data["harness"]["available"]
+
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert saved["model"]["default"] == "gpt-test"
+    assert saved["kanban"]["default_assignee"] == "coder"
+    assert saved["kanban"]["harnesses"]["cli-exec"]["command"] == [
+        sys.executable,
+        "-m",
+        "pytest",
+    ]
+    assert saved["kanban"]["harnesses"]["cli-exec"]["pass_prompt"] == "stdin"
+    assert saved["kanban"]["harnesses"]["cli-exec"]["prompt_file"] == ".task.md"
+
+
+def test_put_profile_harness_upserts_tmux_specific_fields(client, kanban_home):
+    import yaml
+
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    config_path = profile_dir / "config.yaml"
+    config_path.write_text("kanban: {}\n", encoding="utf-8")
+
+    r = client.put(
+        "/api/plugins/kanban/harness/profile/coder",
+        json={
+            "name": "tmux",
+            "config": {
+                "command": [sys.executable],
+                "pass_prompt": "send-keys",
+                "prompt_file": ".hermes-task.md",
+                "session_name": "lane-{task_id}",
+                "send_keys": "Read {prompt_file}",
+            },
+        },
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["harnesses"]["tmux"]["config"]["session_name"] == "lane-{task_id}"
+    assert data["harnesses"]["tmux"]["config"]["send_keys"] == "Read {prompt_file}"
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert saved["kanban"]["harnesses"]["tmux"]["command"] == [sys.executable]
+    assert saved["kanban"]["harnesses"]["tmux"]["pass_prompt"] == "send-keys"
+    assert saved["kanban"]["harnesses"]["tmux"]["session_name"] == "lane-{task_id}"
+    assert saved["kanban"]["harnesses"]["tmux"]["send_keys"] == "Read {prompt_file}"
+
+
+def test_put_profile_harness_deletes_only_named_definition(client, kanban_home):
+    import yaml
+
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    config_path = profile_dir / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "kanban:",
+                "  harness: cli-exec",
+                "  require_clean_complete: true",
+                "  harnesses:",
+                "    cli-exec:",
+                "      command: [codex, exec]",
+                "    tmux:",
+                "      command: [tmux]",
+                "      pass_prompt: send-keys",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    r = client.put(
+        "/api/plugins/kanban/harness/profile/coder",
+        json={"name": "cli-exec", "config": None},
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["ok"] is True
+    assert "cli-exec" not in data["harnesses"]
+    assert "tmux" in data["harnesses"]
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert saved["kanban"]["harness"] == "cli-exec"
+    assert saved["kanban"]["require_clean_complete"] is True
+    assert "cli-exec" not in saved["kanban"]["harnesses"]
+    assert saved["kanban"]["harnesses"]["tmux"]["command"] == ["tmux"]
+
+
+def test_put_profile_harness_rejects_invalid_config_without_writing(client, kanban_home):
+    import yaml
+
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    config_path = profile_dir / "config.yaml"
+    config_path.write_text(
+        "kanban:\n  harnesses:\n    cli-exec:\n      command: [codex, exec]\n",
+        encoding="utf-8",
+    )
+
+    r = client.put(
+        "/api/plugins/kanban/harness/profile/coder",
+        json={
+            "name": "cli-exec",
+            "config": {
+                "command": [sys.executable],
+                "pass_prompt": "bad-mode",
+            },
+        },
+    )
+
+    assert r.status_code == 400
+    assert "pass_prompt" in r.json()["detail"]
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert saved["kanban"]["harnesses"]["cli-exec"]["command"] == ["codex", "exec"]
+
+    r = client.put(
+        "/api/plugins/kanban/harness/profile/coder",
+        json={
+            "name": "cli-exec",
+            "config": {
+                "command": [],
+                "pass_prompt": "stdin",
+            },
+        },
+    )
+
+    assert r.status_code == 400
+    assert "command" in r.json()["detail"]
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert saved["kanban"]["harnesses"]["cli-exec"]["command"] == ["codex", "exec"]
+
+
+def test_put_profile_harness_rejects_unknown_backend_name(client, kanban_home):
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text("kanban: {}\n", encoding="utf-8")
+
+    r = client.put(
+        "/api/plugins/kanban/harness/profile/coder",
+        json={"name": "ghost-cli", "config": {"command": [sys.executable]}},
+    )
+
+    assert r.status_code == 400
+    assert "unsupported harness" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
 # PATCH /tasks/:id harness override
 # ---------------------------------------------------------------------------
 
@@ -705,6 +924,27 @@ def test_dashboard_renders_task_harness_select_control():
     assert "patchErr: patchErr" in js
     assert "props.patchErr" in js
     assert ".hermes-kanban-task-harness-control" in css
+
+
+def test_dashboard_renders_profile_harness_definition_crud():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    style = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css"
+    js = bundle.read_text()
+    css = style.read_text()
+
+    assert "function ProfileHarnessDefinitions(props)" in js
+    assert "function saveProfileHarnessDefinition(name, config)" in js
+    assert "`${API}/harness/profile/${encodeURIComponent(profileName)}`" in js
+    assert "JSON.stringify({ name: name, config: config })" in js
+    assert "onHarnessChange: loadBoardHarness" in js
+    assert "if (props.onChanged) props.onChanged();" in js
+    assert "pass_prompt" in js
+    assert "prompt_file" in js
+    assert "session_name" in js
+    assert "send_keys" in js
+    assert ".hermes-kanban-profile-harnesses" in css
+    assert ".hermes-kanban-profile-harness-row" in css
 
 
 # ---------------------------------------------------------------------------

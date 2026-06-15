@@ -41,6 +41,7 @@ import logging
 import shutil
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -55,6 +56,8 @@ from hermes_cli import kanban_diagnostics as kd
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_PROFILE_HARNESS_DEFINITION_NAMES = frozenset({"cli-exec", "tmux"})
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +402,97 @@ def _validate_defined_harness(
     return requested
 
 
+def _validate_profile_harness_name(name: str) -> str:
+    """Return a supported profile harness definition name or raise 400."""
+    requested = str(name or "").strip()
+    if not requested:
+        raise HTTPException(status_code=400, detail="harness name cannot be empty")
+    if requested == kanban_db.DEFAULT_SPAWN_BACKEND:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{kanban_db.DEFAULT_SPAWN_BACKEND!r} is built in and cannot be redefined",
+        )
+    if requested not in _PROFILE_HARNESS_DEFINITION_NAMES:
+        supported = ", ".join(sorted(_PROFILE_HARNESS_DEFINITION_NAMES))
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported harness {requested!r}; supported harnesses: {supported}",
+        )
+    return requested
+
+
+def _validate_profile_harness_config(name: str, config: dict[str, Any]) -> None:
+    """Validate a profile harness config using the backend's authoritative parser."""
+    try:
+        if name == "cli-exec":
+            kanban_db.CliExecConfig.from_mapping(config)
+        elif name == "tmux":
+            kanban_db.TmuxLaneConfig.from_mapping(config)
+        else:
+            _validate_profile_harness_name(name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@contextmanager
+def _profile_scope(profile: str):
+    """Scope config load/save calls to one Hermes profile directory."""
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        canon = profiles_mod.normalize_profile_name(profile)
+        if not profiles_mod.profile_exists(canon):
+            raise HTTPException(status_code=404, detail=f"profile {profile!r} not found")
+        profile_dir = profiles_mod.get_profile_dir(canon)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid profile {profile!r}: {exc}")
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(profile_dir))
+    try:
+        yield canon
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _profile_harnesses_payload(profile: str) -> dict[str, Any]:
+    """Return profile-scoped harness definitions without board.yaml overlays."""
+    try:
+        from hermes_cli.config import load_config
+
+        with _profile_scope(profile) as canon:
+            cfg = load_config() or {}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"failed to load profile config: {exc}")
+
+    kanban_section = cfg.get("kanban") if isinstance(cfg, dict) else {}
+    if not isinstance(kanban_section, dict):
+        kanban_section = {}
+    harnesses = kanban_section.get("harnesses")
+    definitions = harnesses if isinstance(harnesses, dict) else {}
+
+    payload: dict[str, Any] = {}
+    for raw_name in sorted(definitions):
+        name = str(raw_name)
+        block = definitions.get(raw_name)
+        payload[name] = {
+            "config": block if isinstance(block, dict) else None,
+            "defined": isinstance(block, dict),
+            "binary_on_path": _harness_binary_on_path(name, block),
+        }
+
+    return {
+        "profile": canon,
+        "default_harness": str(kanban_section.get("harness") or "").strip() or None,
+        "harnesses": payload,
+    }
+
+
 # Hallucination-warning event kinds — see complete_task() in kanban_db.py.
 # completion_blocked_hallucination: kernel rejected created_cards with
 #   phantom ids; task stays in prior state.
@@ -707,6 +801,11 @@ class BoardHarnessBody(BaseModel):
     harness: Optional[str] = None
 
 
+class ProfileHarnessBody(BaseModel):
+    name: str
+    config: Optional[dict[str, Any]] = None
+
+
 @router.put("/harness/board")
 def set_board_harness(
     payload: BoardHarnessBody,
@@ -740,6 +839,62 @@ def set_board_harness(
             board=board,
         ),
     }
+
+
+@router.get("/harness/profile/{profile}")
+def get_profile_harnesses(profile: str):
+    """Return profile-scoped harness definitions without board overlays."""
+    return _profile_harnesses_payload(profile)
+
+
+@router.put("/harness/profile/{profile}")
+def set_profile_harness(
+    profile: str,
+    payload: ProfileHarnessBody,
+    board: Optional[str] = Query(None, description="Board slug used only for returned effective state"),
+):
+    """Create, update, or delete one profile ``kanban.harnesses`` definition."""
+    board = _resolve_board(board)
+    name = _validate_profile_harness_name(payload.name)
+    config = payload.config
+    if config is not None:
+        _validate_profile_harness_config(name, config)
+
+    try:
+        from hermes_cli.config import load_config, save_config
+
+        with _profile_scope(profile) as canon:
+            cfg = load_config() or {}
+            if not isinstance(cfg, dict):
+                cfg = {}
+            kanban_section = cfg.setdefault("kanban", {})
+            if not isinstance(kanban_section, dict):
+                kanban_section = {}
+                cfg["kanban"] = kanban_section
+            harnesses = kanban_section.setdefault("harnesses", {})
+            if not isinstance(harnesses, dict):
+                harnesses = {}
+                kanban_section["harnesses"] = harnesses
+
+            if config is None:
+                harnesses.pop(name, None)
+            else:
+                harnesses[name] = config
+
+            save_config(cfg)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"failed to save profile harness: {exc}")
+
+    response = _profile_harnesses_payload(canon)
+    response["ok"] = True
+    response["harness"] = _harness_resolution_payload(
+        task=None,
+        profile=canon,
+        board=board,
+    )
+    return response
 
 
 # ---------------------------------------------------------------------------
