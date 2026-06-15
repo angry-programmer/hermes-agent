@@ -383,6 +383,22 @@
   color: var(--color-destructive, #d14a4a);
 }
 
+.hermes-kanban-harness-alert {
+  flex-basis: 100%;
+  max-width: 18rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.68rem;
+  line-height: 1.25;
+}
+
+.hermes-kanban-harness-alert--warning {
+  color: color-mix(in srgb, #b18613 88%, var(--color-foreground));
+}
+
+.hermes-kanban-harness-alert--danger {
+  color: var(--color-destructive, #d14a4a);
+}
+
 .hermes-kanban-task-harness-control {
   display: inline-flex;
   align-items: center;

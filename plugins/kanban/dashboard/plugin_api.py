@@ -332,6 +332,7 @@ def _harness_resolution_payload(
     definitions = harnesses if isinstance(harnesses, dict) else {}
     defined = harness == kanban_db.DEFAULT_SPAWN_BACKEND or harness in definitions
     selected_block = definitions.get(harness) if isinstance(definitions, dict) else None
+    selected_command = _harness_command(harness, selected_block) if defined else None
 
     available = [
         {
@@ -359,6 +360,7 @@ def _harness_resolution_payload(
         "defined": bool(defined),
         "binary_on_path": _harness_binary_on_path(harness, selected_block)
         if defined else None,
+        "binary": selected_command[0] if selected_command else None,
         "native": harness == kanban_db.DEFAULT_SPAWN_BACKEND,
         "profile": resolved_profile,
         "board": kanban_db._normalize_board_slug(board) or kanban_db.get_current_board(),

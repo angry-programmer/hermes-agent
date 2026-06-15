@@ -274,6 +274,7 @@
     if (!data) return "Loading harness status...";
     const label = data.harness || data.effective || "hermes-native";
     const source = data.source || "native";
+    const sourceText = `Winning source: ${source}. Precedence: task > board > profile > native.`;
     const prefix = context === "task"
       ? "Task harness"
       : "Board default harness";
@@ -281,12 +282,43 @@
       const outcome = data.effective && data.effective !== label
         ? `Dispatch will fall back to ${data.effective}.`
         : "Dispatch will fail until that harness has a valid config block.";
-      return `${prefix}: ${label} from ${source}, but no matching definition exists. ${outcome} Precedence: task > board > profile > native.`;
+      return `${prefix}: ${label} from ${source}, but no matching definition exists. ${outcome} ${sourceText}`;
     }
     if (data.binary_on_path === false) {
-      return `${prefix}: ${label} from ${source}, but its configured binary is not on PATH. Dispatch will fail until the binary is installed.`;
+      const binary = data.binary || "configured binary";
+      return `${prefix}: ${label} from ${source}, but ${binary} is not on PATH. Dispatch will fail until the binary is installed. ${sourceText}`;
     }
-    return `${prefix}: ${label} from ${source}. Precedence: task > board > profile > native.`;
+    return `${prefix}: ${label} from ${source}. ${sourceText}`;
+  }
+
+  function harnessAlert(data) {
+    if (!data) return null;
+    const label = data.harness || data.effective || "hermes-native";
+    if (data.defined === false) {
+      const effective = data.effective || "hermes-native";
+      const message = effective && effective !== label
+        ? `${label} is undefined; dispatch will run ${effective}.`
+        : `${label} is undefined; dispatch will not use it until a matching config block exists.`;
+      return { tone: "danger", message: message };
+    }
+    if (data.binary_on_path === false) {
+      const binary = data.binary || "configured binary";
+      return {
+        tone: "warning",
+        message: `${label} will fail at dispatch: ${binary} not on PATH.`,
+      };
+    }
+    return null;
+  }
+
+  function HarnessValidationMessage(props) {
+    const alert = harnessAlert(props.harness || null);
+    if (!alert) return null;
+    return h("span", {
+      className: cn("hermes-kanban-harness-alert", "hermes-kanban-harness-alert--" + alert.tone),
+      role: "status",
+      title: harnessTitle(props.harness || null, null, props.context),
+    }, alert.message);
   }
 
   function HarnessBadge(props) {
@@ -346,6 +378,7 @@
           : props.error
             ? h("div", { className: "hermes-kanban-harness-note hermes-kanban-harness-note--err" }, props.error)
             : null,
+      h(HarnessValidationMessage, { harness: data, context: "board" }),
     );
   }
 
@@ -392,6 +425,7 @@
         }),
       ),
       busy ? h("span", { className: "hermes-kanban-harness-note" }, "Saving...") : null,
+      h(HarnessValidationMessage, { harness: data, context: "task" }),
     );
   }
 

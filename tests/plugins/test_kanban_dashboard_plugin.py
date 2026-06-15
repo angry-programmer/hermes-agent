@@ -95,6 +95,7 @@ def test_harness_endpoint_defaults_to_native(client):
     assert data["source"] == "native"
     assert data["defined"] is True
     assert data["binary_on_path"] is True
+    assert data["binary"] is None
     assert data["native"] is True
     assert data["profile"] == "default"
     assert data["available"] == [
@@ -136,6 +137,7 @@ def test_harness_endpoint_resolves_board_config_and_binary_status(client, kanban
     assert data["source"] == "board"
     assert data["defined"] is True
     assert data["binary_on_path"] is True
+    assert data["binary"] == sys.executable
     assert data["profile"] == "coder"
     assert {"name": "cli-exec", "defined": True, "binary_on_path": True} in data["available"]
 
@@ -202,6 +204,40 @@ def test_harness_endpoint_surfaces_undefined_harness_fallback(client, kanban_hom
     assert data["source"] == "board"
     assert data["defined"] is False
     assert data["binary_on_path"] is None
+    assert data["binary"] is None
+
+
+def test_harness_endpoint_surfaces_missing_binary_name(client, kanban_home):
+    missing_binary = "definitely-not-on-path-for-hermes-harness"
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text(
+        "\n".join(
+            [
+                "kanban:",
+                "  harnesses:",
+                "    cli-exec:",
+                "      command:",
+                f"        - {missing_binary}",
+                "        - exec",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    kanban_home.joinpath("board.yaml").write_text(
+        "kanban:\n  harness: cli-exec\n",
+        encoding="utf-8",
+    )
+
+    r = client.get("/api/plugins/kanban/harness?board=default&profile=coder")
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["harness"] == "cli-exec"
+    assert data["defined"] is True
+    assert data["binary_on_path"] is False
+    assert data["binary"] == missing_binary
 
 
 def test_set_board_harness_writes_board_yaml_and_returns_effective_state(client, kanban_home):
@@ -881,6 +917,10 @@ def test_dashboard_renders_read_only_harness_badges():
     css = style.read_text()
 
     assert "function HarnessBadge(props)" in js
+    assert "function HarnessValidationMessage(props)" in js
+    assert "Winning source: ${source}. Precedence: task > board > profile > native." in js
+    assert "dispatch will run ${effective}" in js
+    assert "will fail at dispatch: ${binary} not on PATH" in js
     assert "const harnessUrl = assigneeFilter" in js
     assert "SDK.fetchJSON(withBoard(harnessUrl, board))" in js
     assert "withBoard(`${API}/harness?task=${encodeURIComponent(props.taskId)}`, boardSlug)" in js
@@ -889,6 +929,8 @@ def test_dashboard_renders_read_only_harness_badges():
     assert ".hermes-kanban-harness-badge--ok" in css
     assert ".hermes-kanban-harness-badge--warning" in css
     assert ".hermes-kanban-harness-badge--danger" in css
+    assert ".hermes-kanban-harness-alert--warning" in css
+    assert ".hermes-kanban-harness-alert--danger" in css
 
 
 def test_dashboard_renders_board_harness_select_control():
