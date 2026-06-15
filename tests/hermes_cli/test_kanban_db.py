@@ -4976,6 +4976,142 @@ def test_cleanup_worker_tmux_skips_live_pane(kanban_home, tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# G1 — named / parametrized harnesses. ``kanban.harnesses.<name>.backend``
+# decouples the harness NAME from the backend TYPE, so several same-type
+# harnesses (claude-tmux, agy-tmux, fast-codex, ...) can coexist and be
+# selected per task / board / profile. Bare ``harness: tmux`` stays back-compat.
+# ---------------------------------------------------------------------------
+
+
+def _write_profile_kanban(profile, kanban_block):
+    """Write ``<profile>/config.yaml`` with a ``kanban:`` block."""
+    import yaml
+    from hermes_cli.profiles import get_profile_dir
+    d = get_profile_dir(profile)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.yaml").write_text(
+        yaml.safe_dump({"kanban": kanban_block}), encoding="utf-8"
+    )
+
+
+def test_cli_exec_config_ignores_backend_discriminator():
+    # A named harness block carries a 'backend' key; the per-backend config
+    # parser must ignore the extra key rather than choke on it.
+    c = kb.CliExecConfig.from_mapping(
+        {"backend": "cli-exec", "command": ["codex", "exec"]}
+    )
+    assert c.command == ("codex", "exec")
+    t = kb.TmuxLaneConfig.from_mapping({"backend": "tmux", "command": ["claude"]})
+    assert t.command == ("claude",)
+
+
+def test_named_harness_resolves_declared_backend(kanban_home):
+    _write_profile_kanban("coder", {
+        "harness": "claude-tmux",
+        "harnesses": {"claude-tmux": {"backend": "tmux", "command": ["claude"]}},
+    })
+    with kb.connect() as conn:
+        t = kb.get_task(conn, kb.create_task(conn, title="n", assignee="coder"))
+    backend = kb._select_spawn_backend(t, None)
+    assert isinstance(backend, kb.TmuxLaneBackend)
+    assert backend.name == "tmux"
+    # the resolved backend reads ITS OWN named block, not the legacy "tmux" key.
+    assert backend._config_loader("coder", None).command == ("claude",)
+
+
+def test_named_harness_same_backend_type_coexist(kanban_home):
+    # Two tmux-backed harnesses with different commands resolve independently —
+    # exactly the limitation G1 lifts (previously one config per backend type).
+    _write_profile_kanban("coder", {
+        "harnesses": {
+            "claude-tmux": {"backend": "tmux", "command": ["claude"]},
+            "agy-tmux": {"backend": "tmux", "command": ["agy"]},
+        },
+    })
+    with kb.connect() as conn:
+        a = kb.get_task(conn, kb.create_task(
+            conn, title="a", assignee="coder", harness="claude-tmux"))
+        b = kb.get_task(conn, kb.create_task(
+            conn, title="b", assignee="coder", harness="agy-tmux"))
+    ba = kb._select_spawn_backend(a, None)
+    bb = kb._select_spawn_backend(b, None)
+    assert isinstance(ba, kb.TmuxLaneBackend) and isinstance(bb, kb.TmuxLaneBackend)
+    assert ba._config_loader("coder", None).command == ("claude",)
+    assert bb._config_loader("coder", None).command == ("agy",)
+
+
+def test_named_harness_cli_exec_backend(kanban_home):
+    _write_profile_kanban("coder", {
+        "harnesses": {"fast-codex": {
+            "backend": "cli-exec",
+            "command": ["codex", "exec", "--model", "gpt-5.4"],
+        }},
+    })
+    with kb.connect() as conn:
+        t = kb.get_task(conn, kb.create_task(
+            conn, title="c", assignee="coder", harness="fast-codex"))
+    backend = kb._select_spawn_backend(t, None)
+    assert isinstance(backend, kb.CliExecBackend)
+    assert backend.name == "cli-exec"
+    assert backend._config_loader("coder", None).command == (
+        "codex", "exec", "--model", "gpt-5.4")
+
+
+def test_named_harness_unknown_backend_falls_back_native(kanban_home):
+    _write_profile_kanban("coder", {
+        "harness": "weird",
+        "harnesses": {"weird": {"backend": "bogus-backend", "command": ["x"]}},
+    })
+    with kb.connect() as conn:
+        t = kb.get_task(conn, kb.create_task(conn, title="w", assignee="coder"))
+    # a stale/typo'd backend must never wedge dispatch — native fallback.
+    assert kb._select_spawn_backend(t, None).name == kb.DEFAULT_SPAWN_BACKEND
+
+
+def test_named_harness_board_block_overrides_profile(kanban_home):
+    import yaml
+    _write_profile_kanban("coder", {
+        "harnesses": {"claude-tmux": {"backend": "tmux", "command": ["claude"]}},
+    })
+    board_dir = kb.kanban_db_path(board=None).parent
+    (board_dir / "board.yaml").write_text(
+        yaml.safe_dump({"kanban": {"harnesses": {
+            "claude-tmux": {"backend": "tmux", "command": ["claude", "--board"]},
+        }}}), encoding="utf-8",
+    )
+    with kb.connect() as conn:
+        t = kb.get_task(conn, kb.create_task(
+            conn, title="o", assignee="coder", harness="claude-tmux"))
+    backend = kb._select_spawn_backend(t, None)
+    # the board's same-named block shallow-overrides the profile's params.
+    assert backend._config_loader("coder", None).command == ("claude", "--board")
+
+
+def test_bare_backend_name_resolves_when_block_omits_backend(kanban_home):
+    # Back-compat: a legacy harnesses.tmux block (no 'backend' key) selected via
+    # bare `harness: tmux` keeps resolving to the singleton tmux backend.
+    _write_profile_kanban("coder", {
+        "harness": "tmux",
+        "harnesses": {"tmux": {"command": ["codex"]}},
+    })
+    with kb.connect() as conn:
+        t = kb.get_task(conn, kb.create_task(conn, title="bc", assignee="coder"))
+    assert kb._select_spawn_backend(t, None) is kb._SPAWN_BACKENDS["tmux"]
+
+
+def test_resolve_spawn_backend_named_needs_context(kanban_home):
+    _write_profile_kanban("coder", {
+        "harnesses": {"claude-tmux": {"backend": "tmux", "command": ["claude"]}},
+    })
+    # Without (profile, board) context a profile-scoped named harness can't be
+    # resolved (its backend lives in that profile's config) -> native fallback.
+    assert kb.resolve_spawn_backend("claude-tmux").name == kb.DEFAULT_SPAWN_BACKEND
+    # With context it resolves to the declared backend type.
+    assert kb.resolve_spawn_backend(
+        "claude-tmux", profile="coder", board=None).name == "tmux"
+
+
+# ---------------------------------------------------------------------------
 # Per-task external-worker supervisor: heartbeat (log-mtime bridge +
 # backend-aware backstop) and live card progress (log-tailer -> worker_log
 # events).  Items 2+3 of the BYO-harness work — one supervisor, build once.

@@ -545,6 +545,110 @@ def test_put_profile_harness_rejects_unknown_backend_name(client, kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# G1 — named / parametrized harnesses via the dashboard API: a free-form name
+# (claude-tmux, agy-tmux, ...) declares its backend type, so several same-type
+# harnesses coexist in one profile.
+# ---------------------------------------------------------------------------
+
+
+def test_put_profile_harness_creates_named_tmux_with_backend(client, kanban_home):
+    import yaml
+
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    config_path = profile_dir / "config.yaml"
+    config_path.write_text("kanban: {}\n", encoding="utf-8")
+
+    r = client.put(
+        "/api/plugins/kanban/harness/profile/coder",
+        json={
+            "name": "claude-tmux",
+            "config": {
+                "backend": "tmux",
+                "command": [sys.executable],
+                "pass_prompt": "send-keys",
+            },
+        },
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert "claude-tmux" in data["harnesses"]
+    assert data["harnesses"]["claude-tmux"]["config"]["backend"] == "tmux"
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert saved["kanban"]["harnesses"]["claude-tmux"]["backend"] == "tmux"
+    assert saved["kanban"]["harnesses"]["claude-tmux"]["command"] == [sys.executable]
+
+
+def test_put_profile_harness_two_same_backend_named_coexist(client, kanban_home):
+    import yaml
+
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    config_path = profile_dir / "config.yaml"
+    config_path.write_text("kanban: {}\n", encoding="utf-8")
+
+    client.put(
+        "/api/plugins/kanban/harness/profile/coder",
+        json={"name": "claude-tmux", "config": {"backend": "tmux", "command": ["claude"]}},
+    )
+    r = client.put(
+        "/api/plugins/kanban/harness/profile/coder",
+        json={"name": "agy-tmux", "config": {"backend": "tmux", "command": ["agy"]}},
+    )
+
+    assert r.status_code == 200, r.text
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    harnesses = saved["kanban"]["harnesses"]
+    # Two tmux-backed harnesses with different commands live side by side —
+    # the limitation G1 lifts.
+    assert harnesses["claude-tmux"]["command"] == ["claude"]
+    assert harnesses["agy-tmux"]["command"] == ["agy"]
+
+
+def test_put_profile_harness_rejects_unknown_backend_type(client, kanban_home):
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text("kanban: {}\n", encoding="utf-8")
+
+    r = client.put(
+        "/api/plugins/kanban/harness/profile/coder",
+        json={"name": "x-lane", "config": {"backend": "telepathy", "command": ["x"]}},
+    )
+
+    assert r.status_code == 400
+    assert "unsupported backend" in r.json()["detail"]
+
+
+def test_named_harness_effective_resolves_to_declared_backend(client, kanban_home):
+    profile_dir = kanban_home / "profiles" / "coder"
+    profile_dir.mkdir(parents=True)
+    profile_dir.joinpath("config.yaml").write_text(
+        "\n".join([
+            "kanban:",
+            "  harness: claude-tmux",
+            "  harnesses:",
+            "    claude-tmux:",
+            "      backend: tmux",
+            "      command: [claude]",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    r = client.get("/api/plugins/kanban/harness?profile=coder")
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # The harness NAME is the named definition; the EFFECTIVE backend type is
+    # what the engine will dispatch to.
+    assert data["harness"] == "claude-tmux"
+    assert data["effective"] == "tmux"
+    assert data["source"] == "profile"
+    assert data["defined"] is True
+
+
+# ---------------------------------------------------------------------------
 # PATCH /tasks/:id harness override
 # ---------------------------------------------------------------------------
 
@@ -987,6 +1091,22 @@ def test_dashboard_renders_profile_harness_definition_crud():
     assert "send_keys" in js
     assert ".hermes-kanban-profile-harnesses" in css
     assert ".hermes-kanban-profile-harness-row" in css
+
+
+def test_dashboard_renders_profile_harness_backend_selector():
+    # G1: the profile-harness form takes a FREE-FORM name and a SEPARATE backend
+    # selector, so several same-backend harnesses (claude-tmux, agy-tmux) can be
+    # defined. The backend type — not the name — drives the backend-specific UI.
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "const [draftBackend, setDraftBackend] = useState(" in js
+    assert "config.backend = draftBackend;" in js
+    assert 'draftBackend === "tmux"' in js
+    assert "setDraftName(e.target.value)" in js          # name is a free-text input
+    assert 'h(SelectOption, { value: "cli-exec" }, "cli-exec")' in js
+    assert 'h(SelectOption, { value: "tmux" }, "tmux")' in js
 
 
 # ---------------------------------------------------------------------------

@@ -2003,7 +2003,8 @@
     const [data, setData] = useState(null);
     const [busy, setBusy] = useState(false);
     const [msg, setMsg] = useState(null);
-    const [draftName, setDraftName] = useState("cli-exec");
+    const [draftName, setDraftName] = useState("");
+    const [draftBackend, setDraftBackend] = useState("cli-exec");
     const [command, setCommand] = useState("");
     const [passPrompt, setPassPrompt] = useState("stdin");
     const [promptFile, setPromptFile] = useState(".hermes-task.md");
@@ -2034,11 +2035,21 @@
 
     useEffect(function () { loadProfileHarnesses(); }, [loadProfileHarnesses]);
 
+    // A definition's backend type comes from its `backend` key (named harness);
+    // a legacy `cli-exec`/`tmux` name doubles as its own type when unset.
+    function inferBackend(name, cfg) {
+      const declared = String((cfg && cfg.backend) || "").trim();
+      const type = declared || name;
+      return type === "tmux" ? "tmux" : "cli-exec";
+    }
+
     function applyDraft(name, config) {
       const cfg = config || {};
+      const backend = inferBackend(name, cfg);
       setDraftName(name);
+      setDraftBackend(backend);
       setCommand(Array.isArray(cfg.command) ? cfg.command.join(" ") : String(cfg.command || ""));
-      setPassPrompt(String(cfg.pass_prompt || (name === "tmux" ? "send-keys" : "stdin")));
+      setPassPrompt(String(cfg.pass_prompt || (backend === "tmux" ? "send-keys" : "stdin")));
       setPromptFile(String(cfg.prompt_file || ".hermes-task.md"));
       setSessionName(String(cfg.session_name || "klane-{task_id}"));
       setSendKeys(String(cfg.send_keys || ""));
@@ -2050,7 +2061,8 @@
         pass_prompt: passPrompt,
         prompt_file: promptFile.trim() || ".hermes-task.md",
       };
-      if (draftName === "tmux") {
+      config.backend = draftBackend;
+      if (draftBackend === "tmux") {
         config.session_name = sessionName.trim() || "klane-{task_id}";
         if (sendKeys.trim()) config.send_keys = sendKeys.trim();
       }
@@ -2079,7 +2091,7 @@
 
     const definitions = data && data.harnesses ? data.harnesses : {};
     const names = Object.keys(definitions).sort();
-    const promptModes = draftName === "tmux"
+    const promptModes = draftBackend === "tmux"
       ? ["send-keys", "file-arg", "none"]
       : ["stdin", "file-arg", "none"];
 
@@ -2137,12 +2149,21 @@
       h("div", { className: "hermes-kanban-profile-harness-form" },
         h("div", { className: "flex flex-col gap-1" },
           h(Label, { className: "text-xs text-muted-foreground" }, "Name"),
-          h(Select, Object.assign({
+          h(Input, {
             value: draftName,
+            onChange: function (e) { setDraftName(e.target.value); },
+            placeholder: "claude-tmux",
+            className: "h-8 text-xs",
+          }),
+        ),
+        h("div", { className: "flex flex-col gap-1" },
+          h(Label, { className: "text-xs text-muted-foreground" }, "backend"),
+          h(Select, Object.assign({
+            value: draftBackend,
             className: "h-8",
           }, selectChangeHandler(function (v) {
             const next = v || "cli-exec";
-            setDraftName(next);
+            setDraftBackend(next);
             setPassPrompt(next === "tmux" ? "send-keys" : "stdin");
           })),
             h(SelectOption, { value: "cli-exec" }, "cli-exec"),
@@ -2154,7 +2175,7 @@
           h(Input, {
             value: command,
             onChange: function (e) { setCommand(e.target.value); },
-            placeholder: draftName === "tmux" ? "codex" : "codex exec",
+            placeholder: draftBackend === "tmux" ? "codex" : "codex exec",
             className: "h-8 text-xs",
           }),
         ),
@@ -2177,7 +2198,7 @@
             className: "h-8 text-xs",
           }),
         ),
-        draftName === "tmux" ? h("div", { className: "flex flex-col gap-1" },
+        draftBackend === "tmux" ? h("div", { className: "flex flex-col gap-1" },
           h(Label, { className: "text-xs text-muted-foreground" }, "session_name"),
           h(Input, {
             value: sessionName,
@@ -2185,7 +2206,7 @@
             className: "h-8 text-xs",
           }),
         ) : null,
-        draftName === "tmux" ? h("div", { className: "flex flex-col gap-1 hermes-kanban-profile-harness-command-field" },
+        draftBackend === "tmux" ? h("div", { className: "flex flex-col gap-1 hermes-kanban-profile-harness-command-field" },
           h(Label, { className: "text-xs text-muted-foreground" }, "send_keys"),
           h(Input, {
             value: sendKeys,
@@ -2196,10 +2217,10 @@
         h("div", { className: "flex items-end gap-2" },
           h(Button, {
             onClick: function () {
-              saveProfileHarnessDefinition(draftName, buildHarnessConfig());
+              saveProfileHarnessDefinition(draftName.trim(), buildHarnessConfig());
             },
             size: "sm",
-            disabled: busy || !command.trim(),
+            disabled: busy || !command.trim() || !draftName.trim(),
           }, busy ? "Saving..." : "Save harness"),
         ),
       ),

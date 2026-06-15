@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 import sqlite3
 import time
@@ -57,7 +58,14 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_PROFILE_HARNESS_DEFINITION_NAMES = frozenset({"cli-exec", "tmux"})
+# Built-in backend *types* a harness definition may declare via its ``backend``
+# key. A definition's NAME is free-form (claude-tmux, agy-tmux, ...) — only its
+# backend type is constrained, which is what lets several same-type harnesses
+# coexist (G1). The two legacy names double as their own backend type when a
+# block omits ``backend`` (back-compat for plain ``cli-exec`` / ``tmux`` blocks).
+_SUPPORTED_HARNESS_BACKENDS = frozenset({"cli-exec", "tmux"})
+_LEGACY_BACKEND_HARNESS_NAMES = frozenset({"cli-exec", "tmux"})
+_HARNESS_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -260,12 +268,29 @@ def _default_harness_profile() -> str:
         return "default"
 
 
+def _definition_backend_type(name: str, block: Any) -> Optional[str]:
+    """Backend type for a harness definition, or ``None`` if undeterminable.
+
+    A block's explicit ``backend`` key wins (named/parametrized harness); else a
+    legacy name (``cli-exec`` / ``tmux``) doubles as its own backend type.
+    """
+    declared = ""
+    if isinstance(block, dict):
+        declared = str(block.get("backend") or "").strip()
+    if declared:
+        return declared
+    if name in _LEGACY_BACKEND_HARNESS_NAMES:
+        return name
+    return None
+
+
 def _harness_command(name: str, block: Any) -> Optional[tuple[str, ...]]:
-    """Return configured argv for known harness definitions."""
+    """Return configured argv for a harness definition (by its backend type)."""
+    backend_type = _definition_backend_type(name, block)
     try:
-        if name == "cli-exec":
+        if backend_type == "cli-exec":
             return kanban_db.CliExecConfig.from_mapping(block).command
-        if name == "tmux":
+        if backend_type == "tmux":
             return kanban_db.TmuxLaneConfig.from_mapping(block).command
     except (AttributeError, ValueError):
         return None
@@ -327,7 +352,9 @@ def _harness_resolution_payload(
             harness = kanban_db.DEFAULT_SPAWN_BACKEND
             source = "native"
 
-    effective = kanban_db.resolve_spawn_backend(harness).name
+    effective = kanban_db.resolve_spawn_backend(
+        harness, profile=resolved_profile, board=board
+    ).name
     harnesses = merged_cfg.get("harnesses")
     definitions = harnesses if isinstance(harnesses, dict) else {}
     defined = harness == kanban_db.DEFAULT_SPAWN_BACKEND or harness in definitions
@@ -405,7 +432,13 @@ def _validate_defined_harness(
 
 
 def _validate_profile_harness_name(name: str) -> str:
-    """Return a supported profile harness definition name or raise 400."""
+    """Return a well-formed, free-form harness definition name or raise 400.
+
+    Names are free-form (G1: ``claude-tmux``, ``agy-tmux``, ...) — the backend
+    *type* is constrained by the config's ``backend`` key, validated separately
+    by :func:`_validate_profile_harness_config`. The native default is built in
+    and cannot be redefined.
+    """
     requested = str(name or "").strip()
     if not requested:
         raise HTTPException(status_code=400, detail="harness name cannot be empty")
@@ -414,24 +447,49 @@ def _validate_profile_harness_name(name: str) -> str:
             status_code=400,
             detail=f"{kanban_db.DEFAULT_SPAWN_BACKEND!r} is built in and cannot be redefined",
         )
-    if requested not in _PROFILE_HARNESS_DEFINITION_NAMES:
-        supported = ", ".join(sorted(_PROFILE_HARNESS_DEFINITION_NAMES))
+    if not _HARNESS_NAME_RE.match(requested):
         raise HTTPException(
             status_code=400,
-            detail=f"unsupported harness {requested!r}; supported harnesses: {supported}",
+            detail=(
+                f"invalid harness name {requested!r}; use letters, digits, "
+                "'.', '_', '-' (must start alphanumeric)"
+            ),
         )
     return requested
 
 
 def _validate_profile_harness_config(name: str, config: dict[str, Any]) -> None:
-    """Validate a profile harness config using the backend's authoritative parser."""
+    """Validate a harness config against its declared backend's parser.
+
+    The backend type comes from the config's ``backend`` key (named harness) or,
+    for the legacy ``cli-exec`` / ``tmux`` names, from the name itself. A
+    non-legacy name with no ``backend`` declared, or an unknown backend type, is
+    rejected — so a typo can't write an undispatchable definition.
+    """
+    backend_type = _definition_backend_type(name, config)
+    if backend_type is None:
+        supported = ", ".join(sorted(_SUPPORTED_HARNESS_BACKENDS))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unsupported harness {name!r}: declare a 'backend' "
+                f"(one of: {supported})"
+            ),
+        )
+    if backend_type not in _SUPPORTED_HARNESS_BACKENDS:
+        supported = ", ".join(sorted(_SUPPORTED_HARNESS_BACKENDS))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unsupported backend {backend_type!r} for harness {name!r}; "
+                f"supported backends: {supported}"
+            ),
+        )
     try:
-        if name == "cli-exec":
+        if backend_type == "cli-exec":
             kanban_db.CliExecConfig.from_mapping(config)
-        elif name == "tmux":
+        elif backend_type == "tmux":
             kanban_db.TmuxLaneConfig.from_mapping(config)
-        else:
-            _validate_profile_harness_name(name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

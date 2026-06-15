@@ -7309,15 +7309,36 @@ def register_spawn_backend(backend: SpawnBackend) -> None:
     _SPAWN_BACKENDS[backend.name] = backend
 
 
-def resolve_spawn_backend(name: Optional[str]) -> SpawnBackend:
-    """Look up a backend by name, falling back to the native default.
+def resolve_spawn_backend(
+    name: Optional[str],
+    *,
+    profile: Optional[str] = None,
+    board: Optional[str] = None,
+) -> SpawnBackend:
+    """Look up a backend by harness name, falling back to the native default.
+
+    Resolution order for a non-empty ``name``:
+
+    1. **Named / parametrized harness** — if ``kanban.harnesses.<name>`` (in the
+       ``(profile, board)`` config) declares a ``backend`` (``tmux`` /
+       ``cli-exec`` / ...), build that backend bound to read the named block.
+       This is what lets several same-backend harnesses (``claude-tmux``,
+       ``agy-tmux``, ...) coexist: the harness *name* is decoupled from the
+       backend *type*.
+    2. **Bare backend name** — ``name`` is itself a registered backend type
+       (``tmux``, ``cli-exec``, ``hermes-native``). Back-compat for a plain
+       ``harness: tmux`` and for blocks that omit ``backend``.
 
     An unknown or empty name resolves to ``hermes-native`` rather than raising:
     a stale or mistyped harness value must never wedge dispatch — the task still
     runs on the always-available native backend (a warning is logged so the
-    misconfiguration is visible).
+    misconfiguration is visible). Config-read errors are likewise non-fatal:
+    resolution falls through to the bare-name path.
     """
     if name:
+        named = _resolve_named_backend(name, profile, board)
+        if named is not None:
+            return named
         backend = _SPAWN_BACKENDS.get(name)
         if backend is not None:
             return backend
@@ -7326,6 +7347,48 @@ def resolve_spawn_backend(name: Optional[str]) -> SpawnBackend:
             name, DEFAULT_SPAWN_BACKEND,
         )
     return _SPAWN_BACKENDS[DEFAULT_SPAWN_BACKEND]
+
+
+def _resolve_named_backend(
+    name: str, profile: Optional[str], board: Optional[str]
+) -> Optional[SpawnBackend]:
+    """Resolve a named/parametrized harness to a backend instance, or ``None``.
+
+    Returns ``None`` when ``name`` does not name a config block that declares a
+    ``backend`` — the caller then treats ``name`` as a bare backend type. A
+    declared-but-unknown ``backend`` resolves to native (with a warning) so a
+    typo never wedges dispatch. Config-read failures return ``None`` (defer to
+    bare-name resolution) rather than raising.
+    """
+    try:
+        block = _named_harness_block(name, profile, board)
+    except Exception as exc:  # noqa: BLE001 — config errors must not wedge dispatch
+        _log.warning("kanban: could not read harness %r config (%s)", name, exc)
+        return None
+    if not isinstance(block, dict):
+        return None
+    backend_type = str(block.get("backend") or "").strip()
+    if not backend_type:
+        return None
+    factory = _NAMED_BACKEND_FACTORIES.get(backend_type)
+    if factory is None:
+        _log.warning(
+            "harness %r declares unknown backend %r; falling back to %s",
+            name, backend_type, DEFAULT_SPAWN_BACKEND,
+        )
+        return _SPAWN_BACKENDS[DEFAULT_SPAWN_BACKEND]
+    return factory(name)
+
+
+def _named_harness_block(
+    name: str, profile: Optional[str], board: Optional[str]
+) -> Optional[dict]:
+    """The ``kanban.harnesses.<name>`` mapping for ``(profile, board)``, or None."""
+    harnesses = _kanban_config(profile, board).get("harnesses")
+    if isinstance(harnesses, dict):
+        block = harnesses.get(name)
+        return block if isinstance(block, dict) else None
+    return None
 
 
 def _select_spawn_backend(task: Task, board: Optional[str]) -> SpawnBackend:
@@ -7339,13 +7402,17 @@ def _select_spawn_backend(task: Task, board: Optional[str]) -> SpawnBackend:
        (``<assignee-profile>/config.yaml``);
     4. the always-available ``hermes-native`` backend.
 
-    The board/profile config defaults let a whole board or profile opt into a
-    harness without stamping every task. An unknown/stale name at any level
-    falls back to native with a warning rather than wedging dispatch -- see
-    ``resolve_spawn_backend``.
+    The resolved name may be a *named* harness (``kanban.harnesses.<name>`` with
+    its own ``backend``) or a bare backend type; ``resolve_spawn_backend`` reads
+    the ``(profile, board)`` config to tell them apart. The board/profile config
+    defaults let a whole board or profile opt into a harness without stamping
+    every task. An unknown/stale name at any level falls back to native with a
+    warning rather than wedging dispatch -- see ``resolve_spawn_backend``.
     """
     name = task.harness or _config_harness_name(task, board)
-    return resolve_spawn_backend(name)
+    return resolve_spawn_backend(
+        name, profile=getattr(task, "assignee", None), board=board
+    )
 
 
 def _assemble_spawn_context(
@@ -8149,6 +8216,42 @@ class TmuxLaneBackend:
 
 
 register_spawn_backend(TmuxLaneBackend())
+
+
+# --- named / parametrized harness factories ---------------------------------
+#
+# A *named* harness (``kanban.harnesses.<name>`` carrying a ``backend`` key) is
+# resolved to a backend instance whose config loader is bound to read that
+# specific ``<name>`` block — decoupling the harness name from the backend type
+# so several same-type harnesses (claude-tmux, agy-tmux, ...) can coexist. The
+# singleton backends registered above keep serving bare ``harness: tmux`` /
+# ``harness: cli-exec`` (and any block that omits ``backend``) unchanged.
+
+
+def _named_config_loader(config_cls, harness_name: str):
+    """A ``(profile, board) -> config`` loader bound to one named harness block.
+
+    Mirrors ``_load_cli_exec_config`` / ``_load_tmux_lane_config`` but reads
+    ``kanban.harnesses[harness_name]`` instead of the hardcoded backend-type key.
+    """
+
+    def _loader(profile: Optional[str], board: Optional[str]):
+        harnesses = _kanban_config(profile, board).get("harnesses")
+        block = harnesses.get(harness_name) if isinstance(harnesses, dict) else None
+        return config_cls.from_mapping(block)
+
+    return _loader
+
+
+# Backend type -> factory(harness_name) building an instance for a named harness.
+_NAMED_BACKEND_FACTORIES: dict[str, Any] = {
+    "cli-exec": lambda harness_name: CliExecBackend(
+        config_loader=_named_config_loader(CliExecConfig, harness_name)
+    ),
+    "tmux": lambda harness_name: TmuxLaneBackend(
+        config_loader=_named_config_loader(TmuxLaneConfig, harness_name)
+    ),
+}
 
 
 def _default_spawn(
