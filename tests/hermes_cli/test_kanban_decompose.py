@@ -345,3 +345,49 @@ def test_decompose_no_aux_client_configured(kanban_home):
 
     assert outcome.ok is False
     assert "no auxiliary client" in outcome.reason
+
+
+def test_decompose_threads_complexity_to_child_harness(kanban_home):
+    # End-to-end: the decomposer's per-child complexity label is mapped to a
+    # harness from the assignee profile's palette via kanban.complexity_routing.
+    import yaml
+    from hermes_cli.profiles import get_profile_dir
+    cd = get_profile_dir("coder")
+    cd.mkdir(parents=True, exist_ok=True)
+    (cd / "config.yaml").write_text(yaml.safe_dump({"kanban": {
+        "harnesses": {
+            "codex-light": {"backend": "cli-exec", "command": ["codex", "exec"]},
+            "cli-exec": {"backend": "cli-exec", "command": ["codex", "exec", "--xhigh"]},
+        },
+        "complexity_routing": {"simple": "codex-light", "complex": "cli-exec"},
+    }}), encoding="utf-8")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "split by complexity",
+        "tasks": [
+            {"title": "rename vars", "body": "mechanical", "assignee": "coder",
+             "complexity": "simple", "parents": []},
+            {"title": "rework engine", "body": "hard", "assignee": "coder",
+             "complexity": "complex", "parents": [0]},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "coder"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 2
+    with kb.connect() as conn:
+        assert kb.get_task(conn, outcome.child_ids[0]).harness == "codex-light"
+        assert kb.get_task(conn, outcome.child_ids[1]).harness == "cli-exec"

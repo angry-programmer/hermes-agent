@@ -228,3 +228,158 @@ def test_decompose_per_child_workspace_override(kanban_home):
         inh = kb.get_task(conn, child_ids[1])
     assert over.workspace_path == "/other/repo"
     assert inh.workspace_path == proj
+
+
+# ---------------------------------------------------------------------------
+# G4' — complexity-aware harness routing on decomposition.  Each child's
+# ``tasks.harness`` is stamped from the assignee profile's palette via a
+# ``kanban.complexity_routing`` map, realising the coder "weak/strong by
+# complexity" model without manual per-card edits.  An explicit per-child
+# ``harness`` wins; an absent/unmapped label leaves harness NULL (inherit).
+# ---------------------------------------------------------------------------
+
+
+def _write_profile_kanban(profile, kanban_block):
+    """Write ``<profile>/config.yaml`` with a ``kanban:`` block (test home)."""
+    import yaml
+    from hermes_cli.profiles import get_profile_dir
+    d = get_profile_dir(profile)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.yaml").write_text(
+        yaml.safe_dump({"kanban": kanban_block}), encoding="utf-8"
+    )
+
+
+_PALETTE = {
+    "harnesses": {
+        "codex-light": {"backend": "cli-exec", "command": ["codex", "exec"]},
+        "claude-tmux": {"backend": "tmux", "command": ["claude"]},
+        "cli-exec": {"backend": "cli-exec", "command": ["codex", "exec", "--xhigh"]},
+    },
+    "complexity_routing": {
+        "simple": "codex-light",
+        "medium": "claude-tmux",
+        "complex": "cli-exec",
+    },
+}
+
+
+def test_decompose_complexity_maps_to_palette_harness(kanban_home):
+    _write_profile_kanban("coder", _PALETTE)
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="mixed-complexity feature")
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[
+                {"title": "tweak copy", "assignee": "coder", "complexity": "simple"},
+                {"title": "new module", "assignee": "coder", "complexity": "medium",
+                 "parents": [0]},
+                {"title": "redesign core", "assignee": "coder", "complexity": "complex",
+                 "parents": [0]},
+            ],
+            author="decomposer",
+        )
+    assert child_ids and len(child_ids) == 3
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child_ids[0]).harness == "codex-light"
+        assert kb.get_task(conn, child_ids[1]).harness == "claude-tmux"
+        assert kb.get_task(conn, child_ids[2]).harness == "cli-exec"
+
+
+def test_decompose_explicit_harness_wins_over_complexity(kanban_home):
+    _write_profile_kanban("coder", _PALETTE)
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "pin it", "assignee": "coder",
+                       "complexity": "simple", "harness": "claude-tmux"}],
+            author="decomposer",
+        )
+    with kb.connect() as conn:
+        # explicit per-child harness beats the complexity mapping
+        assert kb.get_task(conn, child_ids[0]).harness == "claude-tmux"
+
+
+def test_decompose_unmapped_complexity_leaves_harness_none(kanban_home):
+    _write_profile_kanban("coder", {
+        "harnesses": _PALETTE["harnesses"],
+        "complexity_routing": {"simple": "codex-light"},  # no 'complex' key
+    })
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "deep work", "assignee": "coder",
+                       "complexity": "complex"}],
+            author="decomposer",
+        )
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child_ids[0]).harness is None
+
+
+def test_decompose_no_routing_config_leaves_harness_none(kanban_home):
+    # palette defined but NO complexity_routing -> complexity is inert (inherit).
+    _write_profile_kanban("coder", {"harnesses": _PALETTE["harnesses"]})
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "x", "assignee": "coder", "complexity": "simple"}],
+            author="decomposer",
+        )
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child_ids[0]).harness is None
+
+
+def test_decompose_complexity_case_insensitive(kanban_home):
+    _write_profile_kanban("coder", _PALETTE)
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "x", "assignee": "coder", "complexity": "COMPLEX"}],
+            author="decomposer",
+        )
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child_ids[0]).harness == "cli-exec"
+
+
+def test_decompose_routing_is_per_assignee_profile(kanban_home):
+    # Each child's harness is drawn from ITS OWN assignee profile's routing.
+    _write_profile_kanban("coder", {
+        "harnesses": _PALETTE["harnesses"],
+        "complexity_routing": {"complex": "cli-exec"},
+    })
+    _write_profile_kanban("reviewer", {
+        "harnesses": {"claude-opus-tmux": {"backend": "tmux", "command": ["claude"]}},
+        "complexity_routing": {"complex": "claude-opus-tmux"},
+    })
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[
+                {"title": "code it", "assignee": "coder", "complexity": "complex"},
+                {"title": "review it", "assignee": "reviewer", "complexity": "complex",
+                 "parents": [0]},
+            ],
+            author="decomposer",
+        )
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child_ids[0]).harness == "cli-exec"
+        assert kb.get_task(conn, child_ids[1]).harness == "claude-opus-tmux"
+
+
+def test_decompose_no_complexity_leaves_harness_none(kanban_home):
+    # No regression: children without a complexity label get no harness.
+    _write_profile_kanban("coder", _PALETTE)
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "plain", "assignee": "coder"}],
+            author="decomposer",
+        )
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child_ids[0]).harness is None

@@ -70,6 +70,7 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
+        "complexity": "simple|medium|complex",
         "parents": [<int>, ...]
       },
       ...
@@ -89,6 +90,11 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - "complexity" rates how much reasoning each child needs: "simple" for
+    mechanical, low-risk, well-specified edits; "medium" for normal feature
+    work; "complex" for architecture, ambiguity, or high-risk work. The system
+    maps it to the assignee profile's harness palette (a weaker/cheaper model
+    for simple work, a stronger one for complex). Use "medium" if unsure.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -431,12 +437,20 @@ def decompose_task(
             parents = []
         # Clean parent indices: drop non-int and out-of-range.
         clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
-        children.append({
+        complexity = entry.get("complexity")
+        if isinstance(complexity, str) and complexity.strip():
+            complexity = complexity.strip().lower()
+        else:
+            complexity = None
+        child_spec = {
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": chosen,
             "parents": clean_parents,
-        })
+        }
+        if complexity:
+            child_spec["complexity"] = complexity
+        children.append(child_spec)
 
     try:
         with kb.connect_closing() as conn:

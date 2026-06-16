@@ -4896,6 +4896,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    board: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -4910,6 +4911,11 @@ def decompose_triage_task(
             "title": "...",
             "body": "...",                     # optional
             "assignee": "profile-name",        # optional, None -> default fallback
+            "complexity": "simple",            # optional; -> palette harness via
+                                               #   the assignee profile's
+                                               #   kanban.complexity_routing
+            "harness": "claude-tmux",          # optional; explicit per-child
+                                               #   harness, wins over complexity
             "parents": [0, 2],                 # indices into this same children list
         }
 
@@ -5018,11 +5024,14 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            child_harness = _decompose_child_harness(
+                child, assignee=assignee, board=board
+            )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, harness) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5033,6 +5042,7 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    child_harness,
                 ),
             )
             _append_event(
@@ -7830,6 +7840,73 @@ def _config_harness_name(task: Task, board: Optional[str]) -> Optional[str]:
     if not name:
         return None
     return str(name).strip() or None
+
+
+def _complexity_routed_harness(
+    complexity: object,
+    profile: Optional[str],
+    board: Optional[str],
+) -> Optional[str]:
+    """Map a decomposer ``complexity`` label to a harness *name*, or ``None``.
+
+    Reads ``kanban.complexity_routing`` -- a ``{label: harness-name}`` mapping --
+    from the ``(profile, board)`` config. This is the assignee profile's opt-in
+    bridge from a decomposer's complexity assessment (``simple`` / ``medium`` /
+    ``complex`` / ...) to its harness palette (``kanban.harnesses.<name>``),
+    realising "weaker/cheaper model for simple work, stronger for complex".
+
+    Label matching is case-insensitive. An absent mapping, a non-string label,
+    or an unmapped label all yield ``None`` -- the child then inherits the
+    board/profile default (native) exactly as before. Config-read errors are
+    non-fatal (logged, treated as no mapping) so a bad config never wedges a
+    decomposition.
+    """
+    if not isinstance(complexity, str) or not complexity.strip():
+        return None
+    label = complexity.strip().lower()
+    try:
+        routing = _kanban_config(profile, board).get("complexity_routing")
+    except Exception as exc:  # noqa: BLE001 - config errors must not wedge decompose
+        _log.warning("kanban: could not read complexity_routing (%s)", exc)
+        return None
+    if not isinstance(routing, dict):
+        return None
+    lowered = {
+        str(k).strip().lower(): v
+        for k, v in routing.items()
+        if isinstance(k, str)
+    }
+    name = lowered.get(label)
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return name.strip()
+
+
+def _decompose_child_harness(
+    child: dict,
+    *,
+    assignee: Optional[str],
+    board: Optional[str],
+) -> Optional[str]:
+    """Resolve the harness to stamp on a decomposed child task, or ``None``.
+
+    Precedence (first hit wins):
+
+    1. an explicit ``harness`` key on the child dict -- the orchestrator named a
+       specific harness for this child (the rule/prompt path);
+    2. a ``complexity`` label mapped through the *assignee* profile's
+       ``kanban.complexity_routing`` (the complexity-assessment path);
+    3. ``None`` -- the child inherits the board/profile default at dispatch.
+
+    Like ``create_task``, a resolved name is stored as-is: an unknown name is
+    tolerated here and resolved (with a warning, never wedging) at dispatch by
+    ``resolve_spawn_backend``. ``board`` selects the board.yaml overlay so a
+    board can override a profile's routing/palette.
+    """
+    explicit = child.get("harness")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    return _complexity_routed_harness(child.get("complexity"), assignee, board)
 
 
 # --- cli-exec backend (run a CLI harness as a detached worker) --------------
